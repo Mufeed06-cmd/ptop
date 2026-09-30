@@ -38,17 +38,146 @@ def _distribute_minutes(total_minutes: int, num_sections: int = 6) -> list[int]:
     return alloc
 
 
+def _distribute_minutes_adaptive(total_minutes: int, num_sections: int = 6) -> list[int]:
+    """
+    Distributes total_minutes across 6 sections for adaptive lessons:
+    - Intro is shorter: strictly 1 min (for total_minutes >= 6)
+    - Explain and Example get the bulk of the time
+    - Total still strictly equals total_minutes
+    """
+    if total_minutes <= 0:
+        return [0] * num_sections
+    if total_minutes < num_sections:
+        res = [0] * num_sections
+        for i in range(total_minutes):
+            res[i] = 1
+        return res
+
+    # Section 0 (Intro): 1 min
+    # Section 4 (Quiz): 1 min
+    # Section 5 (Recap): 1 min
+    fixed = 3
+    remaining = total_minutes - fixed
+    practice = max(1, int(round(remaining * 0.2)))
+    rem_core = remaining - practice
+    explain = max(2, rem_core // 2)
+    example = max(2, rem_core - explain)
+
+    alloc = [1, explain, example, practice, 1, 1]
+    diff = total_minutes - sum(alloc)
+    if diff > 0:
+        alloc[1] += diff // 2
+        alloc[2] += diff - (diff // 2)
+    elif diff < 0:
+        alloc[2] += diff
+    return alloc
+
+
+def get_fallback_adaptive_lesson(profile: Profile, weak_concept: str) -> Lesson:
+    """Returns a completely distinct hardcoded adaptive remedial lesson focusing on the diagnosed weak concept."""
+    total_minutes = profile.minutes
+    durations = _distribute_minutes_adaptive(total_minutes, 6)
+
+    sections = [
+        LessonSection(
+            id="sec_1_intro",
+            type="intro",
+            title=f"Adaptive Diagnostic Focus: {weak_concept}",
+            minutes=durations[0],
+            content=(
+                f"In this focused adaptive session, we target the specific mental model behind `{weak_concept}`.\n\n"
+                "Instead of re-reading general theory, we isolate the exact boundary mechanics "
+                "where cognitive slips occur."
+            ),
+        ),
+        LessonSection(
+            id="sec_2_explain",
+            type="explain",
+            title="Step-by-Step Execution Trace: range(0, 5)",
+            minutes=durations[1],
+            content=(
+                "The most common off-by-one mistake occurs because humans count inclusively, "
+                "whereas Python evaluates `range(start, stop)` as the half-open interval `[start, stop)`.\n\n"
+                "Here is the exact step-by-step trace of what the Python interpreter does:\n\n"
+                "| Iteration / Step | Current `i` Value | Condition Checked | Loop Body Runs? | What Happens |\n"
+                "|:---:|:---:|:---:|:---:|:---|\n"
+                "| **Step 1** | `i = 0` (Start) | `0 < 5` (True) | ✅ **Runs** | Loop body executes with `i = 0` |\n"
+                "| **Step 2** | `i = 1` | `1 < 5` (True) | ✅ **Runs** | Loop body executes with `i = 1` |\n"
+                "| **Step 3** | `i = 2` | `2 < 5` (True) | ✅ **Runs** | Loop body executes with `i = 2` |\n"
+                "| **Step 4** | `i = 3` | `3 < 5` (True) | ✅ **Runs** | Loop body executes with `i = 3` |\n"
+                "| **Step 5** | `i = 4` | `4 < 5` (True) | ✅ **Runs** | Loop body executes with `i = 4` |\n"
+                "| **Step 6** | `i = 5` (Stop Bound) | `5 < 5` (False) | ❌ **Terminates** | **5 is never reached** — loop exits immediately |\n\n"
+                "**The Golden Rule:** The condition tested on each iteration is `i < stop`. "
+                "The moment `i` reaches 5, the condition evaluates to `False`. Thus, **5 is never reached** inside the loop body!"
+            ),
+            code="# Python half-open interval:\nfor i in range(0, 5):\n    print(i)  # Produces 0, 1, 2, 3, 4\n# 5 is never reached!",
+        ),
+        LessonSection(
+            id="sec_3_example",
+            type="example",
+            title="Visualizing Excluded Stop Bound: range(0, 5)",
+            minutes=durations[2],
+            content=(
+                "Interact with the range strip below. Notice how the stop boundary `5` is highlighted as **STOP (EXCL)**. "
+                "It serves as a guard wall that halts execution before 5 can enter the loop body."
+            ),
+            animation={"component": "range_viz", "start": 0, "end": 5},
+            code="desired_count = 5\nfor i in range(0, desired_count):\n    print(f'Processing item: {i}')\n# Output halts before reaching 5!",
+        ),
+        LessonSection(
+            id="sec_4_practice",
+            type="practice",
+            title="Targeted Practice: Reaching the Stop Value",
+            minutes=durations[3],
+            content=(
+                "**Exercise:** If you need your loop to process numbers 0 through 5 (including 5), "
+                "how should you write the `range()` call?\n\n"
+                "- ❌ `range(0, 5)` stops at 4.\n"
+                "- ✅ `range(0, 6)` stops before 6, including 5!\n\n"
+                "Always add `+ 1` to the desired ending number if you need it included."
+            ),
+            code="# Fix: Add +1 to include 5\nfor n in range(0, 5 + 1):\n    print(n, end=' ')  # Prints: 0 1 2 3 4 5",
+        ),
+        LessonSection(
+            id="sec_5_quiz",
+            type="quiz",
+            title="Concept Verification",
+            minutes=durations[4],
+            content="Next: a 5-question checkpoint on range bounds and loop bodies.",
+        ),
+        LessonSection(
+            id="sec_6_recap",
+            type="recap",
+            title="Adaptive Sprint Recap: Exclusivity Invariant",
+            minutes=durations[5],
+            content=(
+                "Summary:\n"
+                "- In Python, `range(start, stop)` NEVER includes `stop`. **5 is never reached** in `range(0, 5)`.\n"
+                "- To include $N$, specify $N + 1$ as the stop value.\n"
+                "- Indented statements define the loop body."
+            ),
+        ),
+    ]
+
+    return Lesson(
+        id=f"lesson_adaptive_{weak_concept}",
+        topic=f"Python Loops Remediation: {weak_concept}",
+        total_minutes=total_minutes,
+        sections=sections,
+        weak_concept=weak_concept,
+        language=profile.language,
+    )
+
+
 def get_fallback_lesson(profile: Profile, weak_concept: Optional[str] = None) -> Lesson:
     """Returns a hardcoded fallback Python loops lesson conforming strictly to all requirements."""
+    if weak_concept:
+        return get_fallback_adaptive_lesson(profile, weak_concept)
+
     total_minutes = profile.minutes
     durations = _distribute_minutes(total_minutes, 6)
 
-    trace_note = ""
-    if weak_concept:
-        trace_note = (
-            f"\n\n**Focused Remediation on `{weak_concept}`:** Let's trace through loop bounds and execution step-by-step "
-            "to prevent common off-by-one errors and loop body confusion."
-        )
+    greeting = f"Welcome, {profile.name}! " if profile.name and profile.name.strip() and profile.name.lower() != "alex" else ""
 
     sections = [
         LessonSection(
@@ -57,8 +186,8 @@ def get_fallback_lesson(profile: Profile, weak_concept: Optional[str] = None) ->
             title="Introduction to Python Loops",
             minutes=durations[0],
             content=(
-                f"Welcome {profile.name}! In this lesson, we study Python `for` loops.\n"
-                f"Loops allow you to iterate through sequences cleanly without repeating code.{trace_note}"
+                f"{greeting}In this lesson, we study Python `for` loops.\n"
+                "Loops allow you to iterate through sequences cleanly without repeating code."
             ),
         ),
         LessonSection(
@@ -102,7 +231,7 @@ def get_fallback_lesson(profile: Profile, weak_concept: Optional[str] = None) ->
             type="quiz",
             title="Checkpoint Preparation",
             minutes=durations[4],
-            content="Get ready to check your understanding on `range_bounds` and `loop_body` in the quiz.",
+            content="Next: a 5-question checkpoint on range bounds and loop bodies.",
         ),
         LessonSection(
             id="sec_6_recap",
@@ -361,12 +490,18 @@ The example section must have animation: {"component": "range_viz", "start": 0, 
 
     def _normalize_lesson(self, lesson: Lesson, profile: Profile, weak_concept: Optional[str]) -> Lesson:
         """Ensures minute invariants and required animation component on parsed lessons."""
-        durations = _distribute_minutes(profile.minutes, len(lesson.sections) or 6)
+        if weak_concept:
+            durations = _distribute_minutes_adaptive(profile.minutes, len(lesson.sections) or 6)
+        else:
+            durations = _distribute_minutes(profile.minutes, len(lesson.sections) or 6)
+
         for idx, sec in enumerate(lesson.sections):
             if idx < len(durations):
                 sec.minutes = durations[idx]
             if sec.type == "example" and not sec.animation:
                 sec.animation = {"component": "range_viz", "start": 0, "end": 5}
+            if sec.type == "quiz":
+                sec.content = "Next: a 5-question checkpoint on range bounds and loop bodies."
 
         lesson.total_minutes = profile.minutes
         lesson.weak_concept = weak_concept

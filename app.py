@@ -1,269 +1,735 @@
 from __future__ import annotations
 
+import os
+import textwrap
 import streamlit as st
 from schemas import Profile, Answer
 from backend import generate_lesson, generate_quiz, submit_answers
+from animations import render_animation
+import styles
 import db
 
-
+# Page Configuration
 st.set_page_config(
-    page_title="LearnMate - Adaptive Python Loops Tutor",
-    page_icon="🐍",
+    page_title="LearnMate AI | Adaptive Loops Mentor",
+    page_icon="✦",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-
-def render_range_viz(start: int = 0, end: int = 5):
-    """
-    Renders an interactive visual component for range_viz
-    demonstrating start, stop bounds, and loop index progression.
-    """
-    st.markdown("#### 🔍 Interactive Visualizer: `range_viz`")
-    st.info(f"Visualizing `range({start}, {end})` — Notice that start (`{start}`) is included, but stop (`{end}`) is **excluded**!")
-
-    # Interactive step slider
-    values = list(range(start, end))
-    if not values:
-        st.warning("Empty range specified.")
-        return
-
-    current_step = st.slider(
-        "Step through loop iterations:",
-        min_value=0,
-        max_value=len(values) - 1,
-        value=0,
-        help="Slide to see which number the loop variable 'i' holds at each iteration."
-    )
-
-    cols = st.columns(end - start + 1)
-    for idx, col in enumerate(cols):
-        num = start + idx
-        with col:
-            if num < end:
-                if idx == current_step:
-                    st.markdown(
-                        f"<div style='border: 3px solid #2ecc71; background-color: #d5f5e3; "
-                        f"border-radius: 8px; text-align: center; padding: 12px; color: #1e8449;'>"
-                        f"<div style='font-size: 20px; font-weight: bold;'>i = {num}</div>"
-                        f"<span style='font-size: 12px; font-weight: bold;'>Active Step</span></div>",
-                        unsafe_allow_html=True,
-                    )
-                elif idx < current_step:
-                    st.markdown(
-                        f"<div style='border: 1px solid #aed6f1; background-color: #ebf5fb; "
-                        f"border-radius: 8px; text-align: center; padding: 12px; color: #2874a6;'>"
-                        f"<div style='font-size: 20px;'>{num}</div>"
-                        f"<span style='font-size: 11px;'>Visited</span></div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f"<div style='border: 1px solid #d5dbdb; background-color: #f8f9f9; "
-                        f"border-radius: 8px; text-align: center; padding: 12px; color: #566573;'>"
-                        f"<div style='font-size: 20px;'>{num}</div>"
-                        f"<span style='font-size: 11px;'>Pending</span></div>",
-                        unsafe_allow_html=True,
-                    )
-            else:
-                # The stop bound (exclusive)
-                st.markdown(
-                    f"<div style='border: 2px dashed #e74c3c; background-color: #fadbd8; "
-                    f"border-radius: 8px; text-align: center; padding: 12px; color: #922b21;'>"
-                    f"<div style='font-size: 20px; font-weight: bold;'>{num}</div>"
-                    f"<span style='font-size: 11px; font-weight: bold;'>Stop (Excluded)</span></div>",
-                    unsafe_allow_html=True,
-                )
-
-    st.caption(f"Iteration **{current_step + 1} of {len(values)}**: `i = {values[current_step]}` | Loop executes body with `i`.")
+# Apply Teammates' SaaS Styling (flush-left)
+st.markdown(textwrap.dedent(styles.CUSTOM_CSS), unsafe_allow_html=True)
 
 
-# --- Sidebar: User Profile Setup ---
-with st.sidebar:
-    st.title("👤 Learner Profile")
-    learner_name = st.text_input("Name", value="Alex")
-    minutes_input = st.slider(
-        "Available Time (Minutes)",
-        min_value=6,
-        max_value=60,
-        value=15,
-        step=1,
-        help="Section durations will automatically sum strictly to this total.",
-    )
-    skill_level = st.selectbox("Skill Level", ["beginner", "intermediate", "advanced"], index=0)
-    language = st.selectbox("Instruction Language", ["English", "Spanish", "French", "German", "Hindi"], index=0)
+# ----------------------------------------------------
+# Helper Functions
+# ----------------------------------------------------
+def set_step(new_step: str) -> None:
+    """Updates session state flow step and triggers immediate UI refresh."""
+    st.session_state["step"] = new_step
+    st.rerun()
 
-    # Concept mastery tracking in SQLite
-    st.markdown("---")
-    st.subheader("📊 Concept Mastery (SQLite)")
-    current_masteries = db.get_all_mastery()
-    if not current_masteries:
-        # Defaults
-        current_masteries = {"range_bounds": 0.5, "loop_body": 0.5}
-        for cid, sc in current_masteries.items():
-            db.update_mastery(cid, sc)
 
-    for cid, score in current_masteries.items():
-        st.write(f"**{cid}**: `{score:.2f}`")
-        st.progress(min(1.0, max(0.0, score)))
-
-    st.markdown("---")
-    st.subheader("🎯 Target Weak Concept")
-    concept_options = ["Auto-Detect (Lowest < 0.6)", "range_bounds", "loop_body", "None"]
-    selected_concept = st.selectbox("Focus Focus Area", concept_options, index=0)
-
-    if selected_concept.startswith("Auto"):
-        below_thresh = {c: s for c, s in current_masteries.items() if s < 0.6}
-        active_weak_concept = min(below_thresh.keys(), key=lambda c: below_thresh[c]) if below_thresh else None
-    elif selected_concept == "None":
-        active_weak_concept = None
-    else:
-        active_weak_concept = selected_concept
-
-    if active_weak_concept:
-        st.warning(f"Targeting Weak Concept: **{active_weak_concept}**")
-
-    profile = Profile(
-        name=learner_name,
-        minutes=minutes_input,
-        skill_level=skill_level,
-        language=language,
-        weak_concepts=[active_weak_concept] if active_weak_concept else [],
-    )
-
-    if st.button("Reset Mastery DB", help="Resets mastery back to default 0.5"):
+def reset_demo() -> None:
+    """Deletes SQLite DB records/file and clears all Streamlit session state."""
+    try:
         db.reset_db()
-        st.rerun()
+        if db.DB_PATH.exists():
+            os.remove(db.DB_PATH)
+    except Exception:
+        pass
+    db.init_db()
+    st.session_state.clear()
+    st.rerun()
 
 
-# --- Main Navigation Tabs ---
-tab_lesson, tab_quiz, tab_progress = st.tabs(["📖 Lesson", "📝 Quiz", "📊 Progress & Results"])
+# ----------------------------------------------------
+# Session State Initialization
+# ----------------------------------------------------
+if "step" not in st.session_state:
+    st.session_state["step"] = "landing"
 
-# --- Tab 1: Lesson ---
-with tab_lesson:
-    st.header("Python Loops Masterclass")
-    st.write(
-        "Generates a lesson chunked into 6 core sections summing strictly to your designated minutes."
+if "user_profile" not in st.session_state:
+    st.session_state["user_profile"] = Profile(
+        name="",
+        minutes=15,
+        language="English",
+        skill_level="beginner",
     )
 
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        generate_clicked = st.button("🚀 Generate Lesson", type="primary")
+if "lesson" not in st.session_state:
+    st.session_state["lesson"] = None
 
-    if generate_clicked or "active_lesson" not in st.session_state:
-        with st.spinner("Generating lesson with Gemini LLM / fallback..."):
-            lesson = generate_lesson(profile, weak_concept=active_weak_concept)
-            st.session_state["active_lesson"] = lesson
+if "quiz" not in st.session_state:
+    st.session_state["quiz"] = None
 
-    active_lesson = st.session_state.get("active_lesson")
+if "result" not in st.session_state:
+    st.session_state["result"] = None
 
-    if active_lesson:
-        sum_minutes = sum(sec.minutes for sec in active_lesson.sections)
-        st.success(
-            f"**Topic:** {active_lesson.topic} | **Total Planned:** {active_lesson.total_minutes} mins "
-            f"(Sections sum: **{sum_minutes} mins**) | Language: **{active_lesson.language}**"
+if "quiz_attempt" not in st.session_state:
+    st.session_state["quiz_attempt"] = 1
+
+if "is_adaptive" not in st.session_state:
+    st.session_state["is_adaptive"] = False
+
+
+# ====================================================
+# SCREEN 0: LANDING SCREEN
+# ====================================================
+def render_landing_screen():
+    st.markdown(styles.render_header(), unsafe_allow_html=True)
+
+    st.markdown(
+        textwrap.dedent(
+            """
+            <div style="text-align: center; padding: 24px 0 16px 0;">
+                <h1 style="font-size: 38px; font-weight: 800; background: linear-gradient(135deg, #a5b4fc 0%, #38bdf8 50%, #818cf8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 8px;">
+                    ✦ LearnMate AI
+                </h1>
+                <p style="font-size: 17.5px; color: #cbd5e1; max-width: 780px; margin: 0 auto 28px auto; line-height: 1.6;">
+                    LearnMate teaches you within your available time, measures what you don't understand, and changes the next lesson to fix it.
+                </p>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns(3, gap="medium")
+
+    with col1:
+        st.markdown(
+            textwrap.dedent(
+                """
+                <div class="lm-card" style="height: 100%; border-color: rgba(56, 189, 248, 0.3);">
+                    <div style="font-size: 26px; margin-bottom: 10px;">⏱️</div>
+                    <h3 style="color: #38bdf8; margin: 0 0 8px 0; font-size: 18px;">Time-Boxed Lessons</h3>
+                    <p style="color: #94a3b8; font-size: 13.5px; line-height: 1.6; margin: 0;">
+                        Specify your available minutes (6 to 60 min). Every section is automatically portioned to guarantee you finish strictly within your schedule.
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
         )
 
-        if active_lesson.weak_concept:
-            st.info(f"Targeting remediation on: **{active_lesson.weak_concept}** (step-by-step trace)")
+    with col2:
+        st.markdown(
+            textwrap.dedent(
+                """
+                <div class="lm-card" style="height: 100%; border-color: rgba(129, 140, 248, 0.3);">
+                    <div style="font-size: 26px; margin-bottom: 10px;">🧠</div>
+                    <h3 style="color: #818cf8; margin: 0 0 8px 0; font-size: 18px;">Adaptive to Your Mistakes</h3>
+                    <p style="color: #94a3b8; font-size: 13.5px; line-height: 1.6; margin: 0;">
+                        Targeted quizzes evaluate cognitive blind spots. If concept mastery falls below 0.6, your next lesson reconstructs the mental model with execution traces.
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
 
-        section_icons = {
-            "intro": "📘",
-            "explain": "💡",
-            "example": "🎨",
-            "practice": "💻",
-            "quiz": "❓",
-            "recap": "🏁",
-        }
+    with col3:
+        st.markdown(
+            textwrap.dedent(
+                """
+                <div class="lm-card" style="height: 100%; border-color: rgba(16, 185, 129, 0.3);">
+                    <div style="font-size: 26px; margin-bottom: 10px;">🗣️</div>
+                    <h3 style="color: #34d399; margin: 0 0 8px 0; font-size: 18px;">English / Telugu / Hindi</h3>
+                    <p style="color: #94a3b8; font-size: 13.5px; line-height: 1.6; margin: 0;">
+                        Multilingual mentoring with authentic regional vernacular concept cues while keeping Python code syntax and industry terms in English.
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
 
-        for sec in active_lesson.sections:
-            icon = section_icons.get(sec.type, "📄")
-            with st.expander(f"{icon} [{sec.type.upper()}] {sec.title} — {sec.minutes} min(s)", expanded=(sec.type in ["intro", "example"])):
+    st.write("")
+    st.write("")
+    col_btn_left, col_btn_center, col_btn_right = st.columns([1, 1.2, 1])
+    with col_btn_center:
+        if st.button("Start Learning 🚀", type="primary", use_container_width=True, key="btn_start_learning_landing"):
+            set_step("form")
+
+
+# ====================================================
+# SCREEN 1: SETUP FORM
+# ====================================================
+def render_form_screen():
+    profile: Profile = st.session_state["user_profile"]
+
+    st.markdown(styles.render_header(profile), unsafe_allow_html=True)
+    st.markdown(styles.render_stepper(1), unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([1.15, 0.85], gap="large")
+
+    with col_left:
+        st.markdown(
+            textwrap.dedent(
+                """
+                <div class="lm-card lm-card-highlight">
+                    <h3 style="margin-top:0; color:#38bdf8; font-size: 20px;">🎯 Configure Your Micro-Sprint</h3>
+                    <p style="color:#94a3b8; font-size: 13.5px; margin-bottom: 4px;">
+                        LearnMate AI adapts to your exact available time budget, diagnoses concepts you struggle with, 
+                        and personalizes the next lesson to cure your blind spots.
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
+
+        with st.form("learning_setup_form"):
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px;'>Learner Name (Optional)</p>", unsafe_allow_html=True)
+            learner_name = st.text_input(
+                "Learner Name",
+                value=profile.name if profile.name else "",
+                placeholder="Optional (e.g. Learner)",
+                key="form_name_input",
+                label_visibility="collapsed",
+            )
+
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Topic</p>", unsafe_allow_html=True)
+            topic_options = [
+                "Python - Loops (available)",
+                "Python - Functions (coming soon)",
+                "DBMS - Normalization (coming soon)",
+            ]
+            topic_choice = st.selectbox(
+                "Topic",
+                topic_options,
+                index=0,
+                key="form_topic_select",
+                label_visibility="collapsed",
+            )
+
+            is_topic_available = ("available" in topic_choice)
+            if not is_topic_available:
+                st.info(f"💡 '{topic_choice.replace(' (coming soon)', '')}' is currently under development and coming soon. Please select 'Python - Loops' to start learning!")
+
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Current Experience Level</p>", unsafe_allow_html=True)
+            level_options = ["beginner", "intermediate", "advanced"]
+            current_level_idx = level_options.index(profile.skill_level) if profile.skill_level in level_options else 0
+            skill_level = st.selectbox(
+                "Level",
+                level_options,
+                index=current_level_idx,
+                key="form_level_select",
+                label_visibility="collapsed",
+            )
+
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Instruction Language</p>", unsafe_allow_html=True)
+            lang_options = ["English", "English + Telugu", "English + Hindi"]
+            current_lang_idx = lang_options.index(profile.language) if profile.language in lang_options else 0
+            language = st.selectbox(
+                "Language",
+                lang_options,
+                index=current_lang_idx,
+                key="form_lang_select",
+                label_visibility="collapsed",
+            )
+
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Available Time Budget (Minutes)</p>", unsafe_allow_html=True)
+            time_budget = st.slider(
+                "Time Budget",
+                min_value=6,
+                max_value=60,
+                value=int(profile.minutes) if profile.minutes >= 6 else 15,
+                step=1,
+                key="form_time_slider",
+                label_visibility="collapsed",
+                help="Section durations will automatically sum strictly to this total.",
+            )
+
+            st.write("")
+            submit_form = st.form_submit_button(
+                "Launch My Personalized Lesson 🚀",
+                type="primary",
+                disabled=not is_topic_available,
+            )
+
+            if submit_form and is_topic_available:
+                new_profile = Profile(
+                    name=learner_name.strip(),
+                    minutes=time_budget,
+                    language=language,
+                    skill_level=skill_level,
+                )
+                st.session_state["user_profile"] = new_profile
+
+                with st.spinner("Synthesizing tailored 6-section lesson & diagnostic checkpoint..."):
+                    lesson = generate_lesson(new_profile)
+                    quiz = generate_quiz(concept_ids=["range_bounds", "loop_body"])
+                    st.session_state["lesson"] = lesson
+                    st.session_state["quiz"] = quiz
+                    st.session_state["is_adaptive"] = False
+                    st.session_state["quiz_attempt"] = 1
+
+                set_step("lesson")
+
+    with col_right:
+        st.markdown(
+            textwrap.dedent(
+                """
+                <div class="lm-card">
+                    <h4 style="color:#a5b4fc; margin-top:0;">⚡ The Closed-Loop Adaptive Engine</h4>
+                    <div style="font-size: 13.5px; color:#cbd5e1; line-height: 1.8;">
+                        <div style="margin-bottom: 12px; display:flex; gap:10px;">
+                            <span style="color:#38bdf8; font-weight:bold;">1. Time Budgeting:</span>
+                            <span>All 6 sections strictly portioned to fit your designated time budget.</span>
+                        </div>
+                        <div style="margin-bottom: 12px; display:flex; gap:10px;">
+                            <span style="color:#38bdf8; font-weight:bold;">2. Interactive Visuals:</span>
+                            <span>Embedded simulator reveals range boundaries and control flow.</span>
+                        </div>
+                        <div style="margin-bottom: 12px; display:flex; gap:10px;">
+                            <span style="color:#38bdf8; font-weight:bold;">3. Checkpoint Quiz:</span>
+                            <span>Targeted questions uncover cognitive blind spots.</span>
+                        </div>
+                        <div style="display:flex; gap:10px;">
+                            <span style="color:#38bdf8; font-weight:bold;">4. Adaptive Cure:</span>
+                            <span>AI diagnoses weak concepts below 0.6 and restructures the next lesson.</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="lm-card" style="border-color: rgba(56, 189, 248, 0.25);">
+                    <h4 style="color:#38bdf8; margin-top:0;">💡 Multilingual Mentorship</h4>
+                    <p style="font-size: 13px; color:#94a3b8; margin:0; line-height: 1.6;">
+                        Need vernacular clarity? Select <b>English + Telugu</b> or <b>English + Hindi</b> 
+                        to receive authentic regional concept explanations while keeping Python code in English.
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
+
+        mastery_map = db.get_all_mastery()
+        if mastery_map:
+            st.markdown(
+                textwrap.dedent(
+                    """
+                    <div class="lm-card">
+                        <h4 style="color:#fcd34d; margin-top:0;">📊 Current Concept Mastery (SQLite)</h4>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
+            for cid, score in mastery_map.items():
+                st.write(f"**{cid}**: `{score:.2f}`")
+                st.progress(min(1.0, max(0.0, score)))
+
+        st.write("")
+        if st.button("🗑️ Reset Demo (Clear SQLite DB & Session)", key="btn_reset_demo_form"):
+            reset_demo()
+
+
+# ====================================================
+# SCREEN 2: LESSON (STANDARD OR ADAPTIVE)
+# ====================================================
+def render_lesson_screen():
+    profile: Profile = st.session_state["user_profile"]
+    lesson = st.session_state.get("lesson")
+    is_adaptive = st.session_state.get("is_adaptive", False)
+    result = st.session_state.get("result")
+
+    if not lesson:
+        set_step("form")
+        return
+
+    st.markdown(styles.render_header(profile), unsafe_allow_html=True)
+    st.markdown(styles.render_stepper(2), unsafe_allow_html=True)
+
+    # What Changed Banner on Adaptive Lesson
+    if is_adaptive and result and result.next_focus:
+        st.markdown(
+            textwrap.dedent(
+                f"""
+                <div class="lm-card" style="border: 2px solid #818cf8; background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(15, 23, 42, 0.9) 100%); margin-bottom: 20px;">
+                    <div style="display:flex; align-items:center; gap:10px; margin-bottom: 6px;">
+                        <span style="font-size: 20px;">🧠</span>
+                        <h3 style="margin:0; color:#a5b4fc; font-size:18px;">What Changed: Adaptive Remedial Focus</h3>
+                    </div>
+                    <p style="color:#f8fafc; font-size:14px; margin-bottom:0; line-height:1.6;">
+                        {result.next_focus}
+                    </p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
+
+        # "Your Mistake" Box showing what the user got wrong and why
+        if result.details:
+            wrong_items = [d for d in result.details if not d.get("is_correct")]
+            if wrong_items:
+                for w in wrong_items:
+                    st.markdown(
+                        textwrap.dedent(
+                            f"""
+                            <div class="lm-card lm-card-danger" style="margin-bottom: 16px;">
+                                <div class="lm-weak-pulse" style="margin-bottom: 6px;">
+                                    <span>⚠️</span> Your Mistake in the Checkpoint Quiz
+                                </div>
+                                <h4 style="color: #f87171; margin-top: 4px; margin-bottom: 8px;">{w['question']}</h4>
+                                <p style="color: #cbd5e1; font-size: 13.5px; margin-bottom: 4px;">
+                                    <b>Your Selected Option:</b> <code style="color:#f87171;">{w['selected_answer']}</code> (Index {w['selected_index']})
+                                </p>
+                                <p style="color: #cbd5e1; font-size: 13.5px; margin-bottom: 6px;">
+                                    <b>Correct Answer:</b> <code style="color:#34d399;">{w['correct_answer']}</code> (Index {w['correct_index']})
+                                </p>
+                                <p style="color: #38bdf8; font-size: 13px; margin-bottom: 0;">
+                                    💡 <b>Why this was wrong:</b> {w['explanation']}
+                                </p>
+                            </div>
+                            """
+                        ),
+                        unsafe_allow_html=True,
+                    )
+
+    # Lesson Overview Banner (clean, flush-left HTML without stray tags)
+    sum_minutes = sum(sec.minutes for sec in lesson.sections)
+    adaptive_tag = (
+        '<span class="lm-badge" style="background:rgba(239, 68, 68, 0.2); color:#fca5a5;">🧠 Adaptive Remedial Sprint</span>'
+        if is_adaptive
+        else '<span class="lm-badge" style="background:rgba(56, 189, 248, 0.2); color:#38bdf8;">📖 Standard Sprint</span>'
+    )
+    focus_text = f" | Focus Area: <b>{lesson.weak_concept}</b>" if lesson.weak_concept else ""
+
+    st.markdown(
+        textwrap.dedent(
+            f"""
+            <div class="lm-card lm-card-highlight">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    {adaptive_tag}
+                    <span class="lm-badge lm-badge-timer">⏱️ Total: {lesson.total_minutes} min Budget ({len(lesson.sections)} sections sum: {sum_minutes} min)</span>
+                </div>
+                <h2 style="color: #ffffff; margin-top: 0; font-size: 24px;">{lesson.topic}</h2>
+                <div style="color: #cbd5e1; font-size: 14.5px; line-height: 1.6;">
+                    Language: <b>{lesson.language}</b> | Skill Level: <b>{profile.skill_level.capitalize()}</b>{focus_text}
+                </div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # Render All 6 Lesson Sections with st.markdown inside containers
+    section_icons = {
+        "intro": "📘",
+        "explain": "💡",
+        "example": "🎨",
+        "practice": "💻",
+        "quiz": "❓",
+        "recap": "🏁",
+    }
+
+    for i, sec in enumerate(lesson.sections):
+        icon = section_icons.get(sec.type, "📄")
+        with st.container():
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div style="background: rgba(30, 41, 59, 0.7); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px 12px 0 0; padding: 12px 18px; margin-top: 18px; display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="margin: 0; color: #38bdf8; font-size: 17px;">{icon} [{sec.type.upper()}] {sec.title}</h3>
+                        <span class="lm-badge lm-badge-timer">⏱️ {sec.minutes} min</span>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
+
+            with st.container(border=True):
                 st.markdown(sec.content)
 
                 if sec.code:
+                    st.markdown("<p style='font-size: 12px; font-weight: 700; color: #a5b4fc; margin-bottom: 2px;'>💻 Code Syntax:</p>", unsafe_allow_html=True)
                     st.code(sec.code, language="python")
 
-                # Handle animation component if present (e.g., example section)
-                if sec.animation and sec.animation.get("component") == "range_viz":
-                    render_range_viz(
-                        start=sec.animation.get("start", 0),
-                        end=sec.animation.get("end", 5),
-                    )
+                if sec.animation:
+                    st.markdown("<p style='font-size: 12px; font-weight: 700; color: #38bdf8; margin-top: 10px; margin-bottom: 4px;'>⚙️ Interactive Execution Simulator:</p>", unsafe_allow_html=True)
+                    render_animation(sec.animation)
+
+    # Navigation Footer to Quiz
+    btn_label = "Proceed to Adaptive Checkpoint Quiz ⚡" if is_adaptive else "Proceed to Checkpoint Quiz ⚡"
+    btn_key = "btn_proceed_quiz_adaptive" if is_adaptive else "btn_proceed_quiz_std"
+
+    st.write("")
+    col_nav1, col_nav2 = st.columns([1, 1])
+    with col_nav1:
+        if st.button(btn_label, key=btn_key, type="primary"):
+            set_step("quiz")
+    with col_nav2:
+        if st.button("⬅️ Adjust Setup / Time Budget", key=f"btn_back_form_{is_adaptive}"):
+            set_step("form")
 
 
-# --- Tab 2: Quiz ---
-with tab_quiz:
-    st.header("Loops Checkpoint Quiz")
-    st.write("Answer 5 questions testing your grasp on `range_bounds` and `loop_body` mechanics.")
+# ====================================================
+# SCREEN 3: CHECKPOINT QUIZ
+# ====================================================
+def render_quiz_screen():
+    profile: Profile = st.session_state["user_profile"]
+    quiz = st.session_state.get("quiz")
+    attempt = st.session_state.get("quiz_attempt", 1)
 
-    if "active_quiz" not in st.session_state or st.button("🔄 Generate New Quiz"):
-        with st.spinner("Loading quiz questions..."):
-            st.session_state["active_quiz"] = generate_quiz(concept_ids=["range_bounds", "loop_body"])
+    if not quiz or not quiz.questions:
+        set_step("form")
+        return
 
-    current_quiz = st.session_state["active_quiz"]
+    st.markdown(styles.render_header(profile), unsafe_allow_html=True)
+    st.markdown(styles.render_stepper(3), unsafe_allow_html=True)
 
-    with st.form("quiz_form"):
-        submitted_answers: dict[str, int] = {}
-        for idx, q in enumerate(current_quiz.questions, start=1):
-            st.markdown(f"**Question {idx}:** {q.question}")
-            st.caption(f"Concept: `{q.concept_id}`")
-            choice = st.radio(
-                f"Select an answer for Question {idx}:",
-                options=q.options,
-                key=f"quiz_opt_{q.id}",
-                index=0,
+    st.markdown(
+        textwrap.dedent(
+            f"""
+            <div class="lm-card lm-card-highlight">
+                <h3 style="margin-top:0; color:#38bdf8; font-size: 20px;">⚡ {quiz.topic}</h3>
+                <p style="color:#94a3b8; font-size: 13.5px; margin-bottom: 0;">
+                    Answer the {len(quiz.questions)} questions below. The diagnostic engine evaluates your answers against 
+                    <code>correct_index</code>, updates SQLite concept mastery, and diagnoses any misconceptions.
+                </p>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    with st.form("checkpoint_quiz_form"):
+        submitted_choices: dict[str, int] = {}
+
+        for i, q in enumerate(quiz.questions):
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div style="margin-top: 18px; margin-bottom: 8px;">
+                        <span class="lm-badge" style="background:rgba(56, 189, 248, 0.15); color:#38bdf8;">Question {i + 1} of {len(quiz.questions)}</span>
+                        <span style="font-size: 12px; color: #94a3b8; margin-left: 8px;">Concept ID: <code>{q.concept_id}</code></span>
+                        <h4 style="color: #f8fafc; font-size: 15px; margin-top: 8px; margin-bottom: 10px;">{q.question}</h4>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
             )
-            submitted_answers[q.id] = q.options.index(choice) if choice in q.options else 0
-            st.markdown("---")
 
-        submit_btn = st.form_submit_button("Submit Quiz Answers", type="primary")
+            radio_key = f"quiz_q_{q.id}_attempt_{attempt}"
+            selected_option = st.radio(
+                label=f"Options for {q.id}",
+                options=q.options,
+                index=0,
+                key=radio_key,
+                label_visibility="collapsed",
+            )
+            submitted_choices[q.id] = q.options.index(selected_option) if selected_option in q.options else 0
 
-    if submit_btn:
-        answer_objects = [
-            Answer(question_id=qid, selected_index=s_idx)
-            for qid, s_idx in submitted_answers.items()
-        ]
-        result = submit_answers(answer_objects)
-        st.session_state["quiz_result"] = result
-        st.success(f"Quiz evaluated! Score: {result.score}/{result.total} ({result.percentage}%)")
+            if i < len(quiz.questions) - 1:
+                st.markdown("<hr style='border:0; border-top: 1px solid rgba(255,255,255,0.06); margin: 20px 0;'>", unsafe_allow_html=True)
+
+        st.write("")
+        submit_btn = st.form_submit_button(
+            "Submit Answers & Diagnose Weak Concepts 🧠",
+            type="primary",
+            key=f"btn_submit_quiz_{attempt}",
+        )
+
+        if submit_btn:
+            answers = [
+                Answer(question_id=qid, selected_index=idx)
+                for qid, idx in submitted_choices.items()
+            ]
+            with st.spinner("Scoring against correct_index & updating SQLite mastery EMA..."):
+                result = submit_answers(answers)
+                st.session_state["result"] = result
+            set_step("feedback")
 
 
-# --- Tab 3: Progress & Results ---
-with tab_progress:
-    st.header("Assessment & Diagnostic Results")
-    latest_result = st.session_state.get("quiz_result")
+# ====================================================
+# SCREEN 4: FEEDBACK & ADAPTIVE DIAGNOSIS
+# ====================================================
+def render_feedback_screen():
+    profile: Profile = st.session_state["user_profile"]
+    result = st.session_state.get("result")
 
-    if not latest_result:
-        st.info("Complete the quiz in the 'Quiz' tab to view your score breakdown, mastery updates, and next focus.")
-    else:
-        metric_col1, metric_col2, metric_col3 = st.columns(3)
-        with metric_col1:
-            st.metric("Score", f"{latest_result.score} / {latest_result.total}")
-        with metric_col2:
-            st.metric("Percentage", f"{latest_result.percentage}%")
-        with metric_col3:
-            st.metric("Status", "Passed ✅" if latest_result.passed else "Needs Review ⚠️")
+    if not result:
+        set_step("form")
+        return
 
-        st.markdown(f"**Feedback:** {latest_result.feedback}")
+    st.markdown(styles.render_header(profile), unsafe_allow_html=True)
+    st.markdown(styles.render_stepper(4), unsafe_allow_html=True)
 
-        if latest_result.next_focus:
-            st.info(f"👉 **Next Focus:** {latest_result.next_focus}")
+    # Top Row: Score Display & Weak Concept Alert
+    col_score, col_alert = st.columns([0.8, 1.2], gap="large")
 
-        if latest_result.weak_concept:
-            st.warning(f"⚠️ **Weak Concept Flagged (< 0.6):** `{latest_result.weak_concept}`")
-            if st.button(f"Generate Remedial Lesson on '{latest_result.weak_concept}'"):
-                st.session_state["active_lesson"] = generate_lesson(profile, weak_concept=latest_result.weak_concept)
-                st.success(f"Generated new remedial lesson focusing on '{latest_result.weak_concept}'! Switch to the 'Lesson' tab to study it.")
+    with col_score:
+        score_pct = int(result.percentage)
+        score_color = "#10b981" if score_pct >= 80 else ("#f59e0b" if score_pct >= 50 else "#ef4444")
+        st.markdown(
+            textwrap.dedent(
+                f"""
+                <div class="lm-card" style="text-align: center; border-color: {score_color}55;">
+                    <div class="lm-score-circle" style="border-color: {score_color}; box-shadow: 0 0 25px {score_color}44;">
+                        <div class="lm-score-val" style="color: {score_color};">{score_pct}%</div>
+                        <div class="lm-score-label">{result.score} of {result.total} Correct</div>
+                    </div>
+                    <h4 style="margin: 0; color: #f8fafc;">Diagnostic Performance</h4>
+                    <p style="color: #94a3b8; font-size: 13px; margin-top: 6px;">{result.feedback}</p>
+                </div>
+                """
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with col_alert:
+        if result.weak_concept:
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div class="lm-card lm-card-danger">
+                        <div class="lm-weak-pulse">
+                            <span>⚠️</span> Weak Concept Diagnosed (&lt; 0.6)
+                        </div>
+                        <h3 style="color: #f87171; margin-top: 14px; font-size: 20px;">{result.weak_concept}</h3>
+                        <p style="color: #cbd5e1; font-size: 14px; line-height: 1.6; margin-bottom: 0;">
+                            The SQLite adaptive engine detected low mastery on <b>{result.weak_concept}</b>. 
+                            Rather than forcing you to repeat the entire course, LearnMate creates a targeted 
+                            adaptive lesson below with step-by-step trace explanations!
+                        </p>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
         else:
             st.balloons()
-            st.success("No weak concepts below 0.6! Great job.")
+            st.markdown(
+                textwrap.dedent(
+                    """
+                    <div class="lm-card lm-card-success">
+                        <div class="lm-badge" style="background: rgba(16, 185, 129, 0.2); color:#34d399;">
+                            <span>🏆</span> Full Concept Mastery
+                        </div>
+                        <h3 style="color: #34d399; margin-top: 14px; font-size: 20px;">All Loop Concepts Mastered (≥ 0.6)!</h3>
+                        <p style="color: #cbd5e1; font-size: 14px; line-height: 1.6; margin-bottom: 0;">
+                            You scored high across all tested concepts. Your next adaptive sprint will guide 
+                            you to advanced iteration patterns and optimization techniques.
+                        </p>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
 
-        st.subheader("Question Breakdown (Scored against `correct_index`)")
-        for detail in latest_result.details:
-            icon = "✅" if detail["is_correct"] else "❌"
-            with st.expander(f"{icon} {detail['question'][:60]}..."):
-                st.markdown(f"**Question:** {detail['question']}")
-                st.markdown(f"- **Your Selected Index:** `{detail['selected_index']}` ({detail['selected_answer']})")
-                st.markdown(f"- **Correct Index:** `{detail['correct_index']}` ({detail['correct_answer']})")
-                st.markdown(f"- **Concept ID:** `{detail['concept_id']}`")
-                st.markdown(f"- **Explanation:** {detail['explanation']}")
+    # Concept Mastery Breakdown (SQLite EMA)
+    st.markdown(
+        textwrap.dedent(
+            """
+            <div style="margin-top: 18px; margin-bottom: 12px;">
+                <h4 style="color:#a5b4fc; margin-bottom: 4px;">📊 Concept Mastery Breakdown (SQLite EMA)</h4>
+                <span style="font-size: 12.5px; color: #94a3b8;">Updated via: <code>mastery += 0.3 * (outcome - mastery)</code></span>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    for concept, mastery in result.mastery_scores.items():
+        pct = int(mastery * 100)
+        col_cname, col_cpct = st.columns([1.6, 0.4])
+        with col_cname:
+            st.markdown(f"<span style='font-size: 14px; font-weight: 600; color: #e2e8f0;'>{concept}</span>", unsafe_allow_html=True)
+        with col_cpct:
+            color = "#10b981" if pct >= 60 else "#ef4444"
+            st.markdown(f"<span style='font-size: 14px; font-weight: 700; color: {color}; float: right;'>{mastery:.2f} ({pct}%)</span>", unsafe_allow_html=True)
+        st.progress(float(min(1.0, max(0.0, mastery))))
+
+    # Next Lesson Focus Box
+    st.markdown("<hr style='border:0; border-top: 1px solid rgba(255,255,255,0.08); margin: 24px 0;'>", unsafe_allow_html=True)
+    st.markdown(
+        textwrap.dedent(
+            f"""
+            <div class="lm-card" style="border: 2px solid #6366f1; background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(30, 41, 59, 0.6) 100%); padding: 22px;">
+                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+                    <span style="font-size: 22px;">🎯</span>
+                    <h3 style="margin: 0; color: #a5b4fc; font-size: 18px;">Next lesson focuses on...</h3>
+                </div>
+                <p style="font-size: 14.5px; color: #f1f5f9; line-height: 1.6; margin-bottom: 0;">
+                    {result.next_focus}
+                </p>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # Action Buttons: Start Adaptive Lesson, Reset Form
+    col_adapt_btn, col_reset_btn = st.columns([1.2, 0.8])
+    with col_adapt_btn:
+        if st.button("🚀 Start Adaptive Lesson", key="btn_start_adaptive_lesson", type="primary"):
+            with st.spinner("Generating adaptive remedial lesson tailored to diagnosed weak concept..."):
+                adaptive_lesson = generate_lesson(profile, weak_concept=result.weak_concept)
+                quiz_concepts = [result.weak_concept] if result.weak_concept else ["range_bounds", "loop_body"]
+                adaptive_quiz = generate_quiz(concept_ids=quiz_concepts)
+                st.session_state["lesson"] = adaptive_lesson
+                st.session_state["quiz"] = adaptive_quiz
+                st.session_state["is_adaptive"] = True
+                st.session_state["quiz_attempt"] = st.session_state.get("quiz_attempt", 1) + 1
+            set_step("adaptive_lesson")
+
+    with col_reset_btn:
+        if st.button("🔄 Start New Topic / Reset Form", key="btn_feedback_reset"):
+            set_step("form")
+
+    # Detailed Question-by-Question Review Expander
+    with st.expander("🔍 View Question-by-Question Breakdown & Explanations"):
+        for item in result.details:
+            status_icon = "✅" if item["is_correct"] else "❌"
+            status_color = "#34d399" if item["is_correct"] else "#f87171"
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div style="background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+                        <div style="font-weight: 700; color: {status_color}; margin-bottom: 6px;">
+                            {status_icon} {item['question']}
+                        </div>
+                        <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 4px;">
+                            <b>Concept ID:</b> <code>{item['concept_id']}</code>
+                        </div>
+                        <div style="font-size: 13px; color: #94a3b8; margin-bottom: 6px;">
+                            <b>Your Choice (Index {item['selected_index']}):</b> {item['selected_answer']} | 
+                            <b>Correct (Index {item['correct_index']}):</b> {item['correct_answer']}
+                        </div>
+                        <div style="font-size: 12.5px; color: #38bdf8;">
+                            💡 <b>Explanation:</b> {item['explanation']}
+                        </div>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
+
+    st.write("")
+    if st.button("🗑️ Reset Demo (Clear SQLite DB & Session)", key="btn_reset_demo_feedback"):
+        reset_demo()
+
+
+# ====================================================
+# MAIN DISPATCHER
+# ====================================================
+current_step = st.session_state.get("step", "landing")
+
+if current_step == "landing":
+    render_landing_screen()
+elif current_step == "form":
+    render_form_screen()
+elif current_step == "lesson":
+    render_lesson_screen()
+elif current_step == "quiz":
+    render_quiz_screen()
+elif current_step == "feedback":
+    render_feedback_screen()
+elif current_step in ["adaptive_lesson", "adaptive lesson"]:
+    render_lesson_screen()
+else:
+    render_landing_screen()
