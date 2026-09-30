@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from typing import Optional
+import re
+from pathlib import Path
+from typing import Any, Optional
 from schemas import Profile, Lesson, LessonSection, Quiz, Question
 
 
@@ -166,6 +169,7 @@ def get_fallback_adaptive_lesson(profile: Profile, weak_concept: str) -> Lesson:
         sections=sections,
         weak_concept=weak_concept,
         language=profile.language,
+        source="Fallback",
     )
 
 
@@ -254,6 +258,7 @@ def get_fallback_lesson(profile: Profile, weak_concept: Optional[str] = None) ->
         sections=sections,
         weak_concept=weak_concept,
         language=profile.language,
+        source="Fallback",
     )
 
 
@@ -327,7 +332,158 @@ def get_fallback_quiz(allowed_concept_ids: list[str]) -> Quiz:
         topic="Python Loops Assessment",
         concept_ids=list(allowed_set),
         questions=filtered[:5],
+        source="Fallback",
     )
+
+
+CACHE_DIR = Path(__file__).parent / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def is_python_loops_topic(topic: Optional[str]) -> bool:
+    """Returns True if the topic refers to Python loops."""
+    if not topic:
+        return True
+    t = topic.lower().strip()
+    return ("python" in t and "loop" in t) or t in ["python loops", "python - loops", "loops"]
+
+
+class LiveAINeededError(Exception):
+    """Raised when live AI is needed for a topic but Gemini is unavailable or failed."""
+    pass
+
+
+PYTHON_LOOPS_CONCEPTS = [
+    {
+        "concept_id": "range_bounds",
+        "name": "Range Bounds & Exclusivity",
+        "common_mistake": "Believing range(0, 5) includes 5 instead of stopping at 4",
+    },
+    {
+        "concept_id": "loop_body",
+        "name": "Loop Body Execution & Indentation",
+        "common_mistake": "Misunderstanding which indented statements execute repeatedly within the loop",
+    },
+    {
+        "concept_id": "loop_variables",
+        "name": "Loop Variable Mutation",
+        "common_mistake": "Modifying loop variable inside loop expecting it to change iteration progression",
+    },
+]
+
+
+def _get_concepts_cache_path(topic: str, level: str, goal: Optional[str]) -> Path:
+    t = re.sub(r'[^a-zA-Z0-9]+', '_', topic.lower()).strip('_')
+    lev = re.sub(r'[^a-zA-Z0-9]+', '_', level.lower()).strip('_')
+    g = re.sub(r'[^a-zA-Z0-9]+', '_', (goal or "default").lower()).strip('_')
+    h = hashlib.sha256(f"{topic}|{level}|{goal}".lower().encode()).hexdigest()[:8]
+    return CACHE_DIR / f"concepts_{t}_{lev}_{g}_{h}.json"
+
+
+def load_cached_concepts(topic: str, level: str, goal: Optional[str]) -> Optional[list[dict[str, str]]]:
+    path = _get_concepts_cache_path(topic, level, goal)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and len(data) == 3:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_cached_concepts(topic: str, level: str, goal: Optional[str], concepts: list[dict[str, str]]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _get_concepts_cache_path(topic, level, goal)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(concepts, f, indent=2)
+    except Exception:
+        pass
+
+
+def _get_lesson_cache_path(topic: str, level: str, language: str, minutes: int, weak_concept: Optional[str]) -> Path:
+    t = re.sub(r'[^a-zA-Z0-9]+', '_', topic.lower()).strip('_')
+    lev = re.sub(r'[^a-zA-Z0-9]+', '_', level.lower()).strip('_')
+    lang = re.sub(r'[^a-zA-Z0-9]+', '_', language.lower()).strip('_')
+    wc = re.sub(r'[^a-zA-Z0-9]+', '_', (weak_concept or "none").lower()).strip('_')
+    raw = f"{t}_{lev}_{lang}_{minutes}m_{wc}"
+    h = hashlib.sha256(f"{topic}|{level}|{language}|{minutes}|{weak_concept}".lower().encode()).hexdigest()[:8]
+    return CACHE_DIR / f"lesson_{raw}_{h}.json"
+
+
+def load_cached_lesson(topic: str, level: str, language: str, minutes: int, weak_concept: Optional[str]) -> Optional[Lesson]:
+    path = _get_lesson_cache_path(topic, level, language, minutes, weak_concept)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        lesson = Lesson.model_validate(data["lesson"])
+        lesson.source = "Cached"
+        return lesson
+    except Exception:
+        return None
+
+
+def save_cached_lesson(topic: str, level: str, language: str, minutes: int, weak_concept: Optional[str], lesson: Lesson) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _get_lesson_cache_path(topic, level, language, minutes, weak_concept)
+        payload = {
+            "topic": topic,
+            "level": level,
+            "language": language,
+            "minutes": minutes,
+            "weak_concept": weak_concept,
+            "lesson": lesson.model_dump(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+
+def _validate_concepts_data(data: Any) -> list[dict[str, str]]:
+    if isinstance(data, dict):
+        data = data.get("concepts", data.get("items", list(data.values())[0] if data else []))
+    if not isinstance(data, list) or len(data) != 3:
+        raise ValueError(f"Expected exactly 3 concepts, got {len(data) if isinstance(data, list) else type(data)}")
+    res = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"Concept item {i+1} must be a dict")
+        cid = str(item.get("concept_id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        mistake = str(item.get("common_mistake") or "").strip()
+        if not cid or not name or not mistake:
+            raise ValueError(f"Concept {i+1} missing required keys (concept_id, name, common_mistake)")
+        snake_cid = re.sub(r'[^a-zA-Z0-9]+', '_', cid).strip('_').lower()
+        if not snake_cid:
+            snake_cid = f"concept_{i+1}"
+        res.append({
+            "concept_id": snake_cid,
+            "name": name,
+            "common_mistake": mistake,
+        })
+    return res
+
+
+def _validate_quiz_rules(quiz: Quiz, allowed_concept_ids: list[str]) -> tuple[bool, str]:
+    """Validates that quiz conforms strictly to all 5 questions, 4 options, and allowed concept_ids."""
+    allowed_set = set(allowed_concept_ids)
+    if len(quiz.questions) != 5:
+        return False, f"Expected exactly 5 questions, got {len(quiz.questions)}"
+    for idx, q in enumerate(quiz.questions):
+        if q.concept_id not in allowed_set:
+            return False, f"Question {idx+1} ({q.id}) has concept_id '{q.concept_id}' not in allowed {allowed_concept_ids}"
+        if not q.options or len(q.options) != 4:
+            return False, f"Question {idx+1} ({q.id}) must have exactly 4 options, got {len(q.options) if q.options else 0}"
+        if not (0 <= q.correct_index < 4):
+            return False, f"Question {idx+1} ({q.id}) correct_index {q.correct_index} is out of bounds (0-3)"
+    return True, ""
 
 
 class LLMService:
@@ -348,7 +504,7 @@ class LLMService:
 
     def _setup_client(self) -> None:
         api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
+        if not api_key or api_key.strip() == "paste_your_key_here":
             return
 
         try:
@@ -367,7 +523,8 @@ class LLMService:
 
     @property
     def is_configured(self) -> bool:
-        return bool(os.environ.get("GEMINI_API_KEY")) and self._model is not None
+        api_key = os.environ.get("GEMINI_API_KEY")
+        return bool(api_key and api_key.strip() != "paste_your_key_here") and self._model is not None
 
     def _call_gemini_raw(self, prompt: str) -> str:
         """Invokes Gemini with configured temperature 0.3 and JSON response mode."""
@@ -379,88 +536,180 @@ class LLMService:
         response = self._model.generate_content(prompt)
         return response.text
 
-    def generate_lesson_llm(self, profile: Profile, weak_concept: Optional[str] = None) -> Lesson:
+    def generate_concepts(self, topic: str, level: str = "beginner", goal: Optional[str] = None) -> list[dict[str, str]]:
         """
-        Calls Gemini to generate a Lesson.
+        Generates 3 items {concept_id (snake_case), name, common_mistake} for topic.
+        Uses Gemini JSON mode, validates, retries once on error, caches result.
+        """
+        topic_clean = topic.strip()
+        cached = load_cached_concepts(topic_clean, level, goal)
+        if cached:
+            return cached
+
+        prompt = f"""You are an expert educational curriculum designer.
+For the topic '{topic_clean}' at level '{level}' (learning goal: '{goal or "master core concepts"}'),
+identify exactly 3 distinct foundational concepts required to master this topic.
+For each concept, identify the single most common mistake or misconception learners make.
+
+CRITICAL REQUIREMENT:
+Return a valid JSON array of exactly 3 objects matching this schema:
+[
+  {{
+    "concept_id": "<snake_case_identifier_lowercase_letters_and_underscores_only>",
+    "name": "<Short Human-Readable Concept Name>",
+    "common_mistake": "<Specific common mistake or misconception>"
+  }}
+]
+Rules:
+1. Exactly 3 items in the array.
+2. concept_id must be in snake_case (e.g. inner_join, range_bounds, light_reactions).
+"""
+
+        try:
+            raw_text = self._call_gemini_raw(prompt)
+            data = json.loads(raw_text)
+            concepts = _validate_concepts_data(data)
+            save_cached_concepts(topic_clean, level, goal, concepts)
+            return concepts
+        except Exception as first_error:
+            try:
+                retry_prompt = (
+                    f"{prompt}\n\n"
+                    f"Your previous response failed validation: {str(first_error)}.\n"
+                    "Regenerate strictly valid JSON with exactly 3 objects: concept_id (snake_case), name, common_mistake."
+                )
+                raw_retry = self._call_gemini_raw(retry_prompt)
+                data_retry = json.loads(raw_retry)
+                concepts = _validate_concepts_data(data_retry)
+                save_cached_concepts(topic_clean, level, goal, concepts)
+                return concepts
+            except Exception:
+                if is_python_loops_topic(topic_clean):
+                    save_cached_concepts(topic_clean, level, goal, PYTHON_LOOPS_CONCEPTS)
+                    return PYTHON_LOOPS_CONCEPTS
+                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
+
+    def generate_lesson_llm(self, profile: Profile, weak_concept: Optional[str] = None, topic: Optional[str] = None) -> Lesson:
+        """
+        Calls Gemini to generate a 6-section Lesson for any topic.
         Prompt requirements:
         - "Explain in {language}. Keep code and technical terms in English."
         - If weak_concept is set:
           "The student struggled with {weak_concept}. Use a step-by-step trace explanation and address the common mistake."
-        - JSON response mode, temperature 0.3, retry once if invalid, else fallback.
+        - JSON response mode, temperature 0.3, retry once if invalid, else fallback/error.
+        - Caches by topic+level+language+minutes+weak_concept.
         """
+        active_topic = topic or profile.topic or "Python loops"
         language = profile.language or "English"
 
-        prompt_parts = [
-            f"You are an expert Python programming instructor creating a structured lesson for learner '{profile.name}'.",
-            f"Topic: Python For Loops and range(). Total lesson minutes: {profile.minutes}.",
-            f"Explain in {language}. Keep code and technical terms in English.",
-        ]
+        # Check cache
+        cached = load_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept)
+        if cached:
+            cached.source = "Cached"
+            return cached
+
+        is_py = is_python_loops_topic(active_topic)
+
+        # Get concept_ids to ground the lesson
+        if is_py:
+            concepts = PYTHON_LOOPS_CONCEPTS
+        else:
+            concepts = self.generate_concepts(active_topic, level=profile.skill_level)
+        concepts_summary = "\n".join(
+            f"- Concept `{c['concept_id']}` ({c['name']}): Common Mistake: {c['common_mistake']}"
+            for c in concepts
+        )
+
+        is_py = is_python_loops_topic(active_topic)
+        if is_py:
+            prompt_parts = [
+                f"You are an expert Python programming instructor creating a structured lesson for learner '{profile.name}'.",
+                f"Topic: Python For Loops and range(). Total lesson minutes: {profile.minutes}.",
+                f"Explain in {language}. Keep code and technical terms in English.",
+            ]
+        else:
+            prompt_parts = [
+                f"You are an expert instructor creating a structured lesson for learner '{profile.name}'.",
+                f"Topic: {active_topic}. Total lesson minutes: {profile.minutes}.",
+                f"Explain in {language}. Keep code and technical terms in English.",
+            ]
+
+        prompt_parts.append(f"The lesson must address these key concepts:\n{concepts_summary}")
 
         if weak_concept:
             prompt_parts.append(
                 f"The student struggled with {weak_concept}. Use a step-by-step trace explanation and address the common mistake."
             )
+            prompt_parts.append(
+                f"Provide a step-by-step explanation of {weak_concept} using a different method than lesson 1 (example: analogy or trace)."
+            )
+
+        anim_instruction = (
+            'The example section must have animation: {"component": "range_viz", "start": 0, "end": 5}.'
+            if is_py
+            else 'The example section must have animation: {"component": "step_viz", "steps": [{"title": "<step title>", "detail": "<step detail>"}]} with 3 to 6 steps.'
+        )
 
         prompt_parts.append(
-            """
+            f"""
 Return a valid JSON object matching this schema:
-{
+{{
   "id": "lesson_generated",
-  "topic": "Python For Loops",
-  "total_minutes": <int>,
-  "weak_concept": <string or null>,
-  "language": "<language>",
+  "topic": "{active_topic}",
+  "total_minutes": {profile.minutes},
+  "weak_concept": {json.dumps(weak_concept)},
+  "language": "{language}",
   "sections": [
-    {
+    {{
       "id": "sec_1",
       "type": "intro",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>
-    },
-    {
+    }},
+    {{
       "id": "sec_2",
       "type": "explain",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>,
-      "code": "<python code>"
-    },
-    {
+      "code": "<code snippet or null>"
+    }},
+    {{
       "id": "sec_3",
       "type": "example",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>,
-      "animation": {"component": "range_viz", "start": 0, "end": 5},
-      "code": "<python code>"
-    },
-    {
+      "animation": {{"component": "range_viz", "start": 0, "end": 5}} if Python loops else {{"component": "step_viz", "steps": [...]}},
+      "code": "<code snippet or null>"
+    }},
+    {{
       "id": "sec_4",
       "type": "practice",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>,
-      "code": "<python code>"
-    },
-    {
+      "code": "<code snippet or null>"
+    }},
+    {{
       "id": "sec_5",
       "type": "quiz",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>
-    },
-    {
+    }},
+    {{
       "id": "sec_6",
       "type": "recap",
       "title": "<title>",
       "content": "<content>",
       "minutes": <int>
-    }
+    }}
   ]
-}
+}}
 Exactly 6 sections (types: intro, explain, example, practice, quiz, recap).
-The example section must have animation: {"component": "range_viz", "start": 0, "end": 5}.
+{anim_instruction}
 """
         )
 
@@ -471,7 +720,10 @@ The example section must have animation: {"component": "range_viz", "start": 0, 
             raw_text = self._call_gemini_raw(initial_prompt)
             data = json.loads(raw_text)
             lesson = Lesson.model_validate(data)
-            return self._normalize_lesson(lesson, profile, weak_concept)
+            normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
+            normalized.source = "Live AI"
+            save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
+            return normalized
         except Exception as first_error:
             # Retry once with error message
             try:
@@ -483,49 +735,91 @@ The example section must have animation: {"component": "range_viz", "start": 0, 
                 raw_text_retry = self._call_gemini_raw(retry_prompt)
                 data_retry = json.loads(raw_text_retry)
                 lesson = Lesson.model_validate(data_retry)
-                return self._normalize_lesson(lesson, profile, weak_concept)
+                normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
+                normalized.source = "Live AI"
+                save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
+                return normalized
             except Exception:
-                # Still failed, return hardcoded fallback
-                return get_fallback_lesson(profile, weak_concept)
+                if is_py:
+                    lesson = get_fallback_lesson(profile, weak_concept)
+                    lesson.source = "Fallback"
+                    return lesson
+                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
 
-    def _normalize_lesson(self, lesson: Lesson, profile: Profile, weak_concept: Optional[str]) -> Lesson:
+    def _normalize_lesson(self, lesson: Lesson, profile: Profile, weak_concept: Optional[str], topic: str = "Python loops") -> Lesson:
         """Ensures minute invariants and required animation component on parsed lessons."""
         if weak_concept:
             durations = _distribute_minutes_adaptive(profile.minutes, len(lesson.sections) or 6)
         else:
             durations = _distribute_minutes(profile.minutes, len(lesson.sections) or 6)
 
+        is_py = is_python_loops_topic(topic)
+
         for idx, sec in enumerate(lesson.sections):
             if idx < len(durations):
                 sec.minutes = durations[idx]
-            if sec.type == "example" and not sec.animation:
-                sec.animation = {"component": "range_viz", "start": 0, "end": 5}
+            if sec.type == "example":
+                if is_py and not sec.animation:
+                    sec.animation = {"component": "range_viz", "start": 0, "end": 5}
+                elif not is_py and not sec.animation:
+                    sec.animation = {
+                        "component": "step_viz",
+                        "steps": [
+                            {"title": f"Step 1: Introduction to {topic}", "detail": f"Understanding foundational elements of {topic}."},
+                            {"title": "Step 2: Core Mechanism", "detail": f"Observing how core components of {topic} interact."},
+                            {"title": "Step 3: Synthesis", "detail": f"Completing the operation and evaluating the result in {topic}."},
+                        ],
+                    }
             if sec.type == "quiz":
-                sec.content = "Next: a 5-question checkpoint on range bounds and loop bodies."
+                sec.content = f"Next: a 5-question checkpoint on {topic}."
 
         lesson.total_minutes = profile.minutes
         lesson.weak_concept = weak_concept
         lesson.language = profile.language
+        lesson.topic = topic
         return lesson
 
-    def generate_quiz_llm(self, allowed_concept_ids: list[str]) -> Quiz:
+    def generate_quiz_llm(
+        self,
+        allowed_concept_ids: list[str],
+        topic: str = "Python loops",
+        concepts: Optional[list[dict[str, str]]] = None,
+    ) -> Quiz:
         """
-        Calls Gemini to generate a 5-question Quiz.
-        Quiz questions must use only the allowed concept_ids.
-        JSON response mode, temperature 0.3, retry once if invalid, else fallback.
+        Calls Gemini to generate a 5-question Quiz for topic.
+        Questions must use only the allowed concept_ids.
+        Each question: 1 correct answer, 4 options, concept_id from list,
+        wrong options based on the concept's common_mistake.
+        Rejects and retries if any rule is broken.
         """
+        is_py = is_python_loops_topic(topic)
+
         allowed_list_str = ", ".join(f"'{cid}'" for cid in allowed_concept_ids)
+        mistakes_list = []
+        if concepts:
+            for c in concepts:
+                mistakes_list.append(f"- Concept '{c['concept_id']}': common mistake is '{c.get('common_mistake', '')}'")
+        else:
+            for cid in allowed_concept_ids:
+                mistakes_list.append(f"- Concept '{cid}'")
+        mistakes_block = "\n".join(mistakes_list)
 
         initial_prompt = f"""
-You are an expert Python educational assessment designer.
-Generate a 5-question multiple choice quiz on Python loops.
-CRITICAL CONSTRAINT: Quiz questions must use only the allowed concept_ids: [{allowed_list_str}]. Do NOT use any other concept_id.
-Each question must have 4 options, a 0-based integer 'correct_index' (0, 1, 2, or 3), and an explanation.
+You are an expert educational assessment designer.
+Generate a 5-question multiple choice quiz on '{topic}'.
+CRITICAL CONSTRAINTS:
+1. Exactly 5 questions in the 'questions' array.
+2. Quiz questions must use ONLY the allowed concept_ids: [{allowed_list_str}]. Do NOT use any other concept_id.
+3. Each question must have exactly 4 options.
+4. Exactly one correct answer specified by 0-based integer 'correct_index' (0, 1, 2, or 3).
+5. Wrong options for each question MUST be based on the concept's common mistake:
+{mistakes_block}
+6. Each question must have a clear explanation.
 
 Return a valid JSON object matching this schema:
 {{
   "id": "quiz_generated",
-  "topic": "Python Loops Checkpoint",
+  "topic": "{topic} Checkpoint",
   "concept_ids": {json.dumps(allowed_concept_ids)},
   "questions": [
     {{
@@ -546,45 +840,37 @@ Ensure exactly 5 questions are provided.
             raw_text = self._call_gemini_raw(initial_prompt)
             data = json.loads(raw_text)
             quiz = Quiz.model_validate(data)
-            return self._validate_and_sanitize_quiz(quiz, allowed_concept_ids)
+            is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
+            if not is_valid:
+                raise ValueError(reason)
+            quiz.source = "Live AI"
+            return quiz
         except Exception as first_error:
-            # Retry once with error message
+            # Reject and retry once if any rule is broken
             try:
                 retry_prompt = (
                     f"{initial_prompt}\n\n"
-                    f"Your previous response was invalid. Error: {str(first_error)}.\n"
-                    "Ensure valid JSON with 5 questions using ONLY the allowed concept_ids."
+                    f"Your previous response was rejected due to rule violation: {str(first_error)}.\n"
+                    f"You must strictly fix this: exactly 5 questions, 4 options each, correct_index 0-3, and concept_id strictly from [{allowed_list_str}]."
                 )
                 raw_text_retry = self._call_gemini_raw(retry_prompt)
                 data_retry = json.loads(raw_text_retry)
                 quiz = Quiz.model_validate(data_retry)
-                return self._validate_and_sanitize_quiz(quiz, allowed_concept_ids)
+                is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
+                if not is_valid:
+                    raise ValueError(reason)
+                quiz.source = "Live AI"
+                return quiz
             except Exception:
-                return get_fallback_quiz(allowed_concept_ids)
-
-    def _validate_and_sanitize_quiz(self, quiz: Quiz, allowed_concept_ids: list[str]) -> Quiz:
-        """Enforces that all quiz questions use only the allowed concept_ids and have 5 questions."""
-        allowed_set = set(allowed_concept_ids)
-        valid_questions = []
-
-        for q in quiz.questions:
-            if q.concept_id not in allowed_set:
-                # Force to first allowed concept_id if deviated
-                q.concept_id = allowed_concept_ids[0]
-            valid_questions.append(q)
-
-        # If fewer than 5, supplement with fallback
-        if len(valid_questions) < 5:
-            fallback = get_fallback_quiz(allowed_concept_ids)
-            for fq in fallback.questions:
-                if len(valid_questions) >= 5:
-                    break
-                if not any(eq.id == fq.id for eq in valid_questions):
-                    valid_questions.append(fq)
-
-        quiz.questions = valid_questions[:5]
-        quiz.concept_ids = allowed_concept_ids
-        return quiz
+                if is_py:
+                    return get_fallback_quiz(allowed_concept_ids)
+                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
 
 
 llm_service = LLMService()
+
+
+def generate_concepts(topic: str, level: str = "beginner", goal: Optional[str] = None) -> list[dict[str, str]]:
+    """Module-level function to generate 3 concepts {concept_id, name, common_mistake}."""
+    return llm_service.generate_concepts(topic=topic, level=level, goal=goal)
+

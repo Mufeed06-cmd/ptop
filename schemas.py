@@ -15,6 +15,7 @@ class Profile(BaseModel):
     language: str = "English"
     weak_concepts: list[str] = Field(default_factory=list)
     preferences: dict[str, Any] = Field(default_factory=dict)
+    topic: Optional[str] = None
 
 
 class LessonSection(BaseModel):
@@ -40,6 +41,7 @@ class Lesson(BaseModel):
     sections: list[LessonSection]
     weak_concept: Optional[str] = None
     language: str = "English"
+    source: Optional[str] = "Live AI"
 
 
 class Question(BaseModel):
@@ -53,6 +55,7 @@ class Question(BaseModel):
     correct_index: int
     correct_answer: Optional[str] = None
     explanation: str
+    topic: Optional[str] = None
 
     @model_validator(mode="after")
     def sync_answers(self) -> Question:
@@ -72,6 +75,7 @@ class Quiz(BaseModel):
     topic: str
     concept_ids: list[str]
     questions: list[Question]
+    source: Optional[str] = None
 
 
 class Answer(BaseModel):

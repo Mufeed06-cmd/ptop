@@ -576,13 +576,259 @@ def render_break_continue_html() -> str:
     </html>
     """
 
+def render_step_visualizer_html(steps: list[dict[str, str]]) -> str:
+    """Returns self-contained HTML/CSS/JS for an interactive step-by-step visualizer with stepper, Previous/Next buttons, and progress bar."""
+    import json
+    steps_json = json.dumps(steps)
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
+        body {{ background: #0b0f19; color: #e2e8f0; padding: 12px; }}
+        .vis-card {{
+          background: #111827;
+          border: 1px solid #1f2937;
+          border-radius: 12px;
+          padding: 18px;
+          box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+        }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }}
+        .title {{ font-size: 14.5px; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 8px; }}
+        .badge {{ background: rgba(56, 189, 248, 0.15); color: #38bdf8; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }}
+
+        .progress-track {{
+          background: #1e293b;
+          border-radius: 999px;
+          height: 8px;
+          width: 100%;
+          overflow: hidden;
+          margin-bottom: 16px;
+        }}
+        .progress-fill {{
+          height: 100%;
+          background: linear-gradient(90deg, #38bdf8 0%, #818cf8 100%);
+          transition: width 0.3s ease;
+          border-radius: 999px;
+        }}
+
+        .stepper-dots {{
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 16px;
+          position: relative;
+        }}
+        .dot-node {{
+          width: 28px;
+          height: 28px;
+          border-radius: 50%;
+          background: #1e293b;
+          border: 2px solid #334155;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #94a3b8;
+          cursor: pointer;
+          transition: all 0.25s ease;
+          z-index: 1;
+        }}
+        .dot-node.active {{
+          background: #0284c7;
+          border-color: #38bdf8;
+          color: #ffffff;
+          transform: scale(1.15);
+          box-shadow: 0 0 12px rgba(56, 189, 248, 0.5);
+        }}
+        .dot-node.completed {{
+          background: rgba(16, 185, 129, 0.2);
+          border-color: #10b981;
+          color: #34d399;
+        }}
+
+        .step-content {{
+          background: #090d16;
+          border: 1px solid #1e293b;
+          border-radius: 10px;
+          padding: 16px 18px;
+          margin-bottom: 16px;
+          min-height: 90px;
+        }}
+        .step-header {{
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin-bottom: 8px;
+        }}
+        .step-tag {{
+          background: rgba(129, 140, 248, 0.15);
+          color: #a5b4fc;
+          font-size: 11px;
+          font-weight: 700;
+          padding: 2px 7px;
+          border-radius: 4px;
+          text-transform: uppercase;
+        }}
+        .step-title {{
+          font-size: 15px;
+          font-weight: 700;
+          color: #f8fafc;
+        }}
+        .step-detail {{
+          font-size: 13.5px;
+          color: #cbd5e1;
+          line-height: 1.6;
+        }}
+
+        .stepper-controls {{
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }}
+        .btn-step {{
+          background: linear-gradient(135deg, #0284c7 0%, #06b6d4 100%);
+          border: none;
+          color: white;
+          padding: 7px 16px;
+          border-radius: 6px;
+          font-weight: 600;
+          font-size: 12.5px;
+          cursor: pointer;
+          transition: filter 0.2s, transform 0.1s;
+        }}
+        .btn-step:hover:not(:disabled) {{
+          filter: brightness(1.15);
+          transform: translateY(-1px);
+        }}
+        .btn-step:disabled {{
+          background: #1e293b;
+          color: #64748b;
+          cursor: not-allowed;
+          border: 1px solid #334155;
+        }}
+        .step-status {{
+          font-size: 12px;
+          color: #94a3b8;
+          font-weight: 600;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="vis-card">
+        <div class="header">
+          <div class="title">
+            <span>📍</span> Interactive Step-by-Step Walkthrough
+          </div>
+          <span class="badge" id="step-badge">Step 1 of {len(steps)}</span>
+        </div>
+
+        <div class="progress-track">
+          <div class="progress-fill" id="p-bar" style="width: 0%;"></div>
+        </div>
+
+        <div class="stepper-dots" id="dots-container"></div>
+
+        <div class="step-content">
+          <div class="step-header">
+            <span class="step-tag" id="s-tag">Step 1</span>
+            <h4 class="step-title" id="s-title"></h4>
+          </div>
+          <p class="step-detail" id="s-detail"></p>
+        </div>
+
+        <div class="stepper-controls">
+          <button class="btn-step" id="btn-prev" onclick="prevStep()">⬅ Previous</button>
+          <span class="step-status" id="s-status">Use buttons to navigate</span>
+          <button class="btn-step" id="btn-next" onclick="nextStep()">Next ➡</button>
+        </div>
+      </div>
+
+      <script>
+        const stepsData = {steps_json};
+        let curStep = 0;
+
+        function buildDots() {{
+          const container = document.getElementById('dots-container');
+          container.innerHTML = '';
+          stepsData.forEach((_, idx) => {{
+            const dot = document.createElement('div');
+            dot.className = 'dot-node';
+            dot.id = 'dot-' + idx;
+            dot.innerText = idx + 1;
+            dot.onclick = () => {{ curStep = idx; renderStep(); }};
+            container.appendChild(dot);
+          }});
+        }}
+
+        function renderStep() {{
+          const total = stepsData.length;
+          if (total === 0) return;
+          if (curStep < 0) curStep = 0;
+          if (curStep >= total) curStep = total - 1;
+
+          const s = stepsData[curStep];
+          document.getElementById('s-tag').innerText = 'Step ' + (curStep + 1);
+          document.getElementById('s-title').innerText = s.title || ('Step ' + (curStep + 1));
+          document.getElementById('s-detail').innerText = s.detail || '';
+          document.getElementById('step-badge').innerText = 'Step ' + (curStep + 1) + ' of ' + total;
+
+          const pct = Math.round(((curStep + 1) / total) * 100);
+          document.getElementById('p-bar').style.width = pct + '%';
+
+          document.getElementById('btn-prev').disabled = (curStep === 0);
+          const nextBtn = document.getElementById('btn-next');
+          if (curStep === total - 1) {{
+            nextBtn.innerText = 'Completed ✓';
+            nextBtn.disabled = true;
+          }} else {{
+            nextBtn.innerText = 'Next ➡';
+            nextBtn.disabled = false;
+          }}
+
+          stepsData.forEach((_, idx) => {{
+            const d = document.getElementById('dot-' + idx);
+            if (d) {{
+              d.className = 'dot-node';
+              if (idx < curStep) d.classList.add('completed');
+              else if (idx === curStep) d.classList.add('active');
+            }}
+          }});
+        }}
+
+        function nextStep() {{
+          if (curStep < stepsData.length - 1) {{
+            curStep++;
+            renderStep();
+          }}
+        }}
+
+        function prevStep() {{
+          if (curStep > 0) {{
+            curStep--;
+            renderStep();
+          }}
+        }}
+
+        buildDots();
+        renderStep();
+      </script>
+    </body>
+    </html>
+    """
+
+
 def render_animation(params: Union[dict, str, None]) -> None:
     """
     Renders an interactive animated component in Streamlit.
     Accepts:
     - params: dict, e.g. {"component": "range_viz", "start": 0, "end": 5}
-    - params: str, e.g. "range_visualizer", "while_loop", "break_continue"
-    If the component is unknown, shows nothing instead of crashing.
+    - params: dict, e.g. {"component": "step_viz", "steps": [{"title": "...", "detail": "..."}]}
+    - params: str, e.g. "range_visualizer", "while_loop", "break_continue", "step_viz"
+    If the component is unknown or steps are missing/invalid, shows nothing instead of crashing.
     """
     if not params:
         return
@@ -601,7 +847,27 @@ def render_animation(params: Union[dict, str, None]) -> None:
     else:
         return
 
-    if "range" in component_name:
+    if "step" in component_name:
+        steps = None
+        if isinstance(params, dict):
+            steps = params.get("steps")
+        if not steps or not isinstance(steps, (list, tuple)) or len(steps) == 0:
+            return
+        valid_steps = []
+        for s in steps:
+            if isinstance(s, dict) and (s.get("title") or s.get("detail")):
+                valid_steps.append({
+                    "title": str(s.get("title") or f"Step {len(valid_steps) + 1}"),
+                    "detail": str(s.get("detail") or ""),
+                })
+        if len(valid_steps) == 0:
+            return
+        try:
+            html = render_step_visualizer_html(valid_steps)
+            components.html(html, height=330, scrolling=False)
+        except Exception:
+            return
+    elif "range" in component_name:
         try:
             from visualizer import render_range_visualizer
             components.html(render_range_visualizer(start=start, stop=end, step=step), height=380, scrolling=False)

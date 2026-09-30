@@ -10,19 +10,21 @@ from engine import engine
 
 def generate_lesson(profile: Profile, weak_concept: Optional[str] = None) -> Lesson:
     """
-    Generates a structured Python loops lesson with 6 sections:
+    Generates a structured lesson with 6 sections:
     intro, explain, example, practice, quiz, recap.
     Sum of section minutes strictly equals profile.minutes.
-    The example section has animation={'component': 'range_viz', 'start': 0, 'end': 5}.
-    Calls Gemini with JSON mode, temperature 0.3, with fallback on failure.
+    The example section has animation (range_viz for loops, step_viz for others).
+    Calls Gemini with JSON mode, temperature 0.3, with fallback or error.
     Saves session to SQLite.
     """
-    # If weak_concept is not explicitly passed, inspect db for any concept with mastery < 0.6
+    topic = profile.topic or "Python loops"
+
+    # If weak_concept is not explicitly passed, inspect db for any concept with mastery < 0.6 for this topic
     if weak_concept is None:
-        all_masteries = db.get_all_mastery()
+        all_masteries = db.get_all_mastery(topic=topic)
         weak_concept = engine.determine_weak_concept(all_masteries)
 
-    lesson = llm_service.generate_lesson_llm(profile=profile, weak_concept=weak_concept)
+    lesson = llm_service.generate_lesson_llm(profile=profile, weak_concept=weak_concept, topic=topic)
 
     # Record session to SQLite
     session_id = f"session_{uuid.uuid4().hex[:8]}"
@@ -31,26 +33,32 @@ def generate_lesson(profile: Profile, weak_concept: Optional[str] = None) -> Les
     return lesson
 
 
-def generate_quiz(concept_ids: list[str]) -> Quiz:
+def generate_quiz(
+    concept_ids: list[str],
+    topic: str = "Python loops",
+    concepts: Optional[list[dict[str, str]]] = None,
+) -> Quiz:
     """
-    Generates a 5-question quiz on Python loops.
+    Generates a 5-question quiz for the specified topic.
     Restricts questions strictly to the allowed concept_ids.
     Persists questions into SQLite questions table.
     """
     target_concepts = concept_ids if concept_ids else ["range_bounds", "loop_body"]
 
-    quiz = llm_service.generate_quiz_llm(allowed_concept_ids=target_concepts)
+    quiz = llm_service.generate_quiz_llm(allowed_concept_ids=target_concepts, topic=topic, concepts=concepts)
 
-    # Persist questions to SQLite
+    # Persist questions to SQLite with topic metadata
+    for q in quiz.questions:
+        q.topic = topic
     db.save_questions(quiz.questions)
 
     return quiz
 
 
-def submit_answers(answers: list[Answer]) -> Result:
+def submit_answers(answers: list[Answer], topic: Optional[str] = None) -> Result:
     """
     Scores submitted answers against each question's correct_index.
-    Updates concept mastery in SQLite: mastery += 0.3 * (outcome - mastery).
+    Updates concept mastery in SQLite: mastery += 0.3 * (outcome - mastery) keyed by (topic, concept_id).
     Identifies weak_concept (lowest mastery concept below 0.6).
     Computes next_focus (one-line string).
     """
@@ -58,6 +66,7 @@ def submit_answers(answers: list[Answer]) -> Result:
     questions_dict: dict[str, Question] = {}
     fallback_pool = {q.id: q for q in get_fallback_quiz(["range_bounds", "loop_body"]).questions}
 
+    inferred_topic = topic
     for ans in answers:
         q = db.get_question(ans.question_id)
         if not q and ans.question_id in fallback_pool:
@@ -65,6 +74,10 @@ def submit_answers(answers: list[Answer]) -> Result:
             db.save_question(q)
         if q:
             questions_dict[q.id] = q
+            if not inferred_topic and getattr(q, "topic", None):
+                inferred_topic = q.topic
+
+    resolved_topic = inferred_topic or topic or "Python loops"
 
     # If answers list didn't include some questions, also pull any known questions
     if not questions_dict:
@@ -72,5 +85,5 @@ def submit_answers(answers: list[Answer]) -> Result:
         db.save_questions(list(fallback_pool.values()))
 
     # Score and update mastery via engine
-    result = engine.score_and_update(answers=answers, questions_dict=questions_dict)
+    result = engine.score_and_update(answers=answers, questions_dict=questions_dict, topic=resolved_topic)
     return result

@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from unittest.mock import patch, MagicMock
@@ -186,6 +187,159 @@ class TestLearnMateRealLogic(unittest.TestCase):
         self.assertAlmostEqual(result.mastery_scores["range_bounds"], 0.8285, places=3)
         # 2 loop_body questions: 0.5 -> 0.65 -> 0.755
         self.assertAlmostEqual(result.mastery_scores["loop_body"], 0.755, places=3)
+
+    def test_mastery_keyed_by_topic_and_concept(self):
+        """Requirement 4: Key mastery by (topic, concept_id) in db.py so topics don't mix."""
+        # Update concept in Topic A
+        db.update_mastery("join_logic", 0.85, topic="SQL joins")
+        # Update same concept name in Topic B
+        db.update_mastery("join_logic", 0.35, topic="Photosynthesis")
+
+        # Distinct scores retrieved per topic
+        self.assertEqual(db.get_mastery("join_logic", topic="SQL joins"), 0.85)
+        self.assertEqual(db.get_mastery("join_logic", topic="Photosynthesis"), 0.35)
+
+        # Topic filtering in get_all_mastery
+        all_sql = db.get_all_mastery(topic="SQL joins")
+        self.assertIn("join_logic", all_sql)
+        self.assertEqual(all_sql["join_logic"], 0.85)
+
+        all_photo = db.get_all_mastery(topic="Photosynthesis")
+        self.assertIn("join_logic", all_photo)
+        self.assertEqual(all_photo["join_logic"], 0.35)
+
+    def test_generate_concepts_and_caching(self):
+        """Requirement 2: generate_concepts(topic, level, goal) returns 3 items {concept_id, name, common_mistake} and caches."""
+        from llm import generate_concepts
+
+        # Test fallback concepts for Python loops
+        concepts_py = generate_concepts("Python loops")
+        self.assertEqual(len(concepts_py), 3)
+        for c in concepts_py:
+            self.assertIn("concept_id", c)
+            self.assertIn("name", c)
+            self.assertIn("common_mistake", c)
+            # Must be snake_case
+            self.assertTrue(c["concept_id"].islower() or "_" in c["concept_id"])
+
+        # Test live generation with mock for arbitrary topic
+        mock_concepts_json = json.dumps([
+            {"concept_id": "table_joining", "name": "Table Joining", "common_mistake": "Unintentional cartesian join"},
+            {"concept_id": "null_handling", "name": "NULL Handling", "common_mistake": "Believing inner join preserves NULLs"},
+            {"concept_id": "where_vs_on", "name": "WHERE vs ON", "common_mistake": "Filtering in WHERE instead of ON"},
+        ])
+
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.return_value = mock_concepts_json
+            concepts_sql = generate_concepts("SQL joins", level="intermediate")
+            self.assertEqual(len(concepts_sql), 3)
+            self.assertEqual(concepts_sql[0]["concept_id"], "table_joining")
+            self.assertEqual(mock_call.call_count, 1)
+
+            # Calling again should read from cache and NOT invoke _call_gemini_raw
+            cached_sql = generate_concepts("SQL joins", level="intermediate")
+            self.assertEqual(len(cached_sql), 3)
+            self.assertEqual(mock_call.call_count, 1)  # No extra call!
+
+    def test_quiz_reject_and_retry_if_rule_broken(self):
+        """Requirement 3: Exactly 5 quiz questions, 4 options each, concept_id from list. Reject & retry on violation."""
+        allowed_concepts = ["c1", "c2", "c3"]
+        invalid_quiz_json = json.dumps({
+            "id": "q_invalid",
+            "topic": "Test Topic",
+            "concept_ids": allowed_concepts,
+            "questions": [
+                # Only 1 question instead of 5
+                {"id": "q1", "concept_id": "c1", "question": "Q1?", "options": ["A", "B"], "correct_index": 0, "explanation": "Exp"}
+            ]
+        })
+
+        valid_quiz_json = json.dumps({
+            "id": "q_valid",
+            "topic": "Test Topic",
+            "concept_ids": allowed_concepts,
+            "questions": [
+                {"id": f"q{i}", "concept_id": allowed_concepts[i % 3], "question": f"Q{i}?", "options": ["A", "B", "C", "D"], "correct_index": 0, "explanation": f"Exp {i}"}
+                for i in range(1, 6)
+            ]
+        })
+
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.side_effect = [invalid_quiz_json, valid_quiz_json]
+            quiz = llm_service.generate_quiz_llm(allowed_concepts, topic="Test Topic")
+            # Should have rejected first attempt and retried once
+            self.assertEqual(mock_call.call_count, 2)
+            self.assertEqual(len(quiz.questions), 5)
+            for q in quiz.questions:
+                self.assertIn(q.concept_id, allowed_concepts)
+                self.assertEqual(len(q.options), 4)
+
+    def test_failure_handling_and_offline_python_loops(self):
+        """Requirement 7: If no API key or Gemini fails for new topic, raise LiveAINeededError. Python loops keeps working offline."""
+        from llm import LiveAINeededError
+
+        # New topic fails when Gemini fails
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.side_effect = RuntimeError("Network error")
+            with self.assertRaises(LiveAINeededError) as ctx:
+                generate_lesson(Profile(name="Student", topic="Photosynthesis", minutes=15))
+            self.assertIn("Live AI is needed for this topic. Try Python loops.", str(ctx.exception))
+
+        # Python loops keeps working offline with fallback
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.side_effect = RuntimeError("Offline")
+            lesson = generate_lesson(Profile(name="Student", topic="Python loops", minutes=15))
+            self.assertIsNotNone(lesson)
+            self.assertEqual(len(lesson.sections), 6)
+            self.assertEqual(lesson.source, "Fallback")
+
+    def test_badge_and_lesson_caching(self):
+        """Requirement 8: Show badge Live AI, Cached, or Fallback. Cache by topic+level+language+minutes+weak_concept in cache/."""
+        # 1. Fallback badge
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.side_effect = RuntimeError("Simulate offline")
+            fallback_lesson = llm_service.generate_lesson_llm(Profile(topic="Python loops", minutes=15))
+            self.assertEqual(fallback_lesson.source, "Fallback")
+
+        # 2. Live AI badge & caching
+        valid_lesson = get_fallback_lesson(Profile(topic="Python loops", minutes=15))
+        valid_lesson_json = valid_lesson.model_dump_json()
+
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+            mock_call.return_value = valid_lesson_json
+            p = Profile(name="CacheTester", topic="Python loops", minutes=16, language="English", skill_level="beginner")
+            lesson_live = llm_service.generate_lesson_llm(p)
+            self.assertEqual(lesson_live.source, "Live AI")
+            self.assertEqual(mock_call.call_count, 1)
+
+            # 3. Next call with same topic+level+language+minutes+weak_concept hits cache
+            lesson_cached = llm_service.generate_lesson_llm(p)
+            self.assertEqual(lesson_cached.source, "Cached")
+            self.assertEqual(mock_call.call_count, 1)  # No extra LLM call!
+
+    def test_generic_step_viz_animation(self):
+        """Requirement 6: step_viz component in animations.py with stepper, Previous/Next, and progress bar."""
+        from animations import render_step_visualizer_html, render_animation
+
+        steps = [
+            {"title": "Step 1: Light Absorption", "detail": "Chlorophyll absorbs photons."},
+            {"title": "Step 2: Electron Transport", "detail": "Electrons pass through thylakoid membrane."},
+            {"title": "Step 3: ATP Synthesis", "detail": "Proton gradient drives ATP synthase."},
+        ]
+        html = render_step_visualizer_html(steps)
+        self.assertIn("Step 1: Light Absorption", html)
+        self.assertIn("Previous", html)
+        self.assertIn("Next", html)
+        self.assertIn("progress-fill", html)
+
+        # Invalid or missing steps should not crash
+        try:
+            render_animation({"component": "step_viz", "steps": []})
+            render_animation({"component": "step_viz"})
+            render_animation({"component": "step_viz", "steps": "invalid"})
+            render_animation(None)
+        except Exception as e:
+            self.fail(f"render_animation crashed on invalid input: {e}")
 
 
 if __name__ == "__main__":

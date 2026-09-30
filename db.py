@@ -23,7 +23,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     - sessions
     - questions
     - attempts
-    - mastery(concept_id, score default 0.5)
+    - mastery(topic, concept_id, score default 0.5)
     """
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -58,13 +58,38 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(id),
                 FOREIGN KEY (question_id) REFERENCES questions(id)
             );
-
-            CREATE TABLE IF NOT EXISTS mastery (
-                concept_id TEXT PRIMARY KEY,
-                score REAL DEFAULT 0.5
-            );
             """
         )
+        # Check if mastery table exists and whether it has topic column
+        cursor.execute("PRAGMA table_info(mastery)")
+        cols = {row["name"]: row for row in cursor.fetchall()}
+        if not cols:
+            cursor.execute(
+                """
+                CREATE TABLE mastery (
+                    topic TEXT NOT NULL DEFAULT 'Python loops',
+                    concept_id TEXT NOT NULL,
+                    score REAL DEFAULT 0.5,
+                    PRIMARY KEY (topic, concept_id)
+                )
+                """
+            )
+        elif "topic" not in cols:
+            # Migrate legacy mastery table without topic column
+            cursor.executescript(
+                """
+                CREATE TABLE mastery_new (
+                    topic TEXT NOT NULL DEFAULT 'Python loops',
+                    concept_id TEXT NOT NULL,
+                    score REAL DEFAULT 0.5,
+                    PRIMARY KEY (topic, concept_id)
+                );
+                INSERT OR IGNORE INTO mastery_new (topic, concept_id, score)
+                SELECT 'Python loops', concept_id, score FROM mastery;
+                DROP TABLE mastery;
+                ALTER TABLE mastery_new RENAME TO mastery;
+                """
+            )
         conn.commit()
 
 
@@ -145,41 +170,58 @@ def record_attempt(
         conn.commit()
 
 
-def get_mastery(concept_id: str) -> float:
+def get_mastery(concept_id: str, topic: str = "Python loops") -> float:
     """
-    Retrieves the current mastery score for a concept.
+    Retrieves the current mastery score for (topic, concept_id).
     Defaults to 0.5 if not previously recorded.
     """
     with get_connection() as conn:
-        cursor = conn.execute("SELECT score FROM mastery WHERE concept_id = ?", (concept_id,))
+        cursor = conn.execute(
+            "SELECT score FROM mastery WHERE topic = ? AND concept_id = ?",
+            (topic, concept_id),
+        )
         row = cursor.fetchone()
         if row is not None:
             return float(row["score"])
         # If not present, initialize with default 0.5
-        conn.execute("INSERT OR IGNORE INTO mastery (concept_id, score) VALUES (?, 0.5)", (concept_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO mastery (topic, concept_id, score) VALUES (?, ?, 0.5)",
+            (topic, concept_id),
+        )
         conn.commit()
         return 0.5
 
 
-def update_mastery(concept_id: str, new_score: float) -> None:
-    """Sets or updates the mastery score for a concept."""
+def update_mastery(concept_id: str, new_score: float, topic: str = "Python loops") -> None:
+    """Sets or updates the mastery score for (topic, concept_id)."""
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO mastery (concept_id, score) VALUES (?, ?) ON CONFLICT(concept_id) DO UPDATE SET score = excluded.score",
-            (concept_id, new_score),
+            """
+            INSERT INTO mastery (topic, concept_id, score) VALUES (?, ?, ?)
+            ON CONFLICT(topic, concept_id) DO UPDATE SET score = excluded.score
+            """,
+            (topic, concept_id, new_score),
         )
         conn.commit()
 
 
-def get_all_mastery() -> dict[str, float]:
-    """Returns all concept mastery scores."""
+def get_all_mastery(topic: Optional[str] = None) -> dict[str, float]:
+    """
+    Returns concept mastery scores.
+    If topic is provided, returns {concept_id: score} for that topic.
+    If topic is None, returns {concept_id: score} across all records.
+    """
     with get_connection() as conn:
-        cursor = conn.execute("SELECT concept_id, score FROM mastery")
-        return {row["concept_id"]: float(row["score"]) for row in cursor.fetchall()}
+        if topic is not None:
+            cursor = conn.execute("SELECT concept_id, score FROM mastery WHERE topic = ?", (topic,))
+            return {row["concept_id"]: float(row["score"]) for row in cursor.fetchall()}
+        else:
+            cursor = conn.execute("SELECT concept_id, score FROM mastery")
+            return {row["concept_id"]: float(row["score"]) for row in cursor.fetchall()}
 
 
 def reset_db() -> None:
-    """Clears all table contents (useful for testing)."""
+    """Clears all table contents and cache (useful for testing and demo reset)."""
     with get_connection() as conn:
         conn.executescript(
             """
@@ -190,3 +232,10 @@ def reset_db() -> None:
             """
         )
         conn.commit()
+    cache_dir = Path(__file__).parent / "cache"
+    if cache_dir.exists():
+        for f in cache_dir.glob("*.json"):
+            try:
+                f.unlink()
+            except Exception:
+                pass

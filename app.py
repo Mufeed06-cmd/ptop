@@ -180,6 +180,17 @@ def render_form_screen():
             unsafe_allow_html=True,
         )
 
+        # Quick-pick chips
+        st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:6px;'>Quick-pick topic:</p>", unsafe_allow_html=True)
+        chips = ["Python loops", "SQL joins", "Photosynthesis", "World War 2"]
+        chip_cols = st.columns(4)
+        for col, chip_text in zip(chip_cols, chips):
+            if col.button(chip_text, key=f"chip_btn_{chip_text}", use_container_width=True):
+                st.session_state["topic_input"] = chip_text
+                st.rerun()
+
+        current_topic_val = st.session_state.get("topic_input", profile.topic or "Python loops")
+
         with st.form("learning_setup_form"):
             st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px;'>Learner Name (Optional)</p>", unsafe_allow_html=True)
             learner_name = st.text_input(
@@ -190,23 +201,14 @@ def render_form_screen():
                 label_visibility="collapsed",
             )
 
-            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Topic</p>", unsafe_allow_html=True)
-            topic_options = [
-                "Python - Loops (available)",
-                "Python - Functions (coming soon)",
-                "DBMS - Normalization (coming soon)",
-            ]
-            topic_choice = st.selectbox(
-                "Topic",
-                topic_options,
-                index=0,
-                key="form_topic_select",
+            st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>What do you want to learn?</p>", unsafe_allow_html=True)
+            topic_input = st.text_input(
+                "What do you want to learn?",
+                value=current_topic_val,
+                placeholder="e.g. Python loops, SQL joins, Photosynthesis, World War 2",
+                key="form_topic_input",
                 label_visibility="collapsed",
             )
-
-            is_topic_available = ("available" in topic_choice)
-            if not is_topic_available:
-                st.info(f"💡 '{topic_choice.replace(' (coming soon)', '')}' is currently under development and coming soon. Please select 'Python - Loops' to start learning!")
 
             st.markdown("<p style='font-weight:600; color:#cbd5e1; margin-bottom:4px; margin-top:14px;'>Current Experience Level</p>", unsafe_allow_html=True)
             level_options = ["beginner", "intermediate", "advanced"]
@@ -246,27 +248,41 @@ def render_form_screen():
             submit_form = st.form_submit_button(
                 "Launch My Personalized Lesson 🚀",
                 type="primary",
-                disabled=not is_topic_available,
             )
 
-            if submit_form and is_topic_available:
+            if submit_form:
+                selected_topic = topic_input.strip() if topic_input and topic_input.strip() else "Python loops"
+                st.session_state["topic_input"] = selected_topic
+
                 new_profile = Profile(
                     name=learner_name.strip(),
                     minutes=time_budget,
                     language=language,
                     skill_level=skill_level,
+                    topic=selected_topic,
                 )
                 st.session_state["user_profile"] = new_profile
 
-                with st.spinner("Synthesizing tailored 6-section lesson & diagnostic checkpoint..."):
-                    lesson = generate_lesson(new_profile)
-                    quiz = generate_quiz(concept_ids=["range_bounds", "loop_body"])
-                    st.session_state["lesson"] = lesson
-                    st.session_state["quiz"] = quiz
-                    st.session_state["is_adaptive"] = False
-                    st.session_state["quiz_attempt"] = 1
-
-                set_step("lesson")
+                try:
+                    with st.spinner(f"Synthesizing tailored lesson & checkpoint for '{selected_topic}'..."):
+                        from llm import generate_concepts, LiveAINeededError, is_python_loops_topic
+                        concepts = generate_concepts(selected_topic, level=skill_level)
+                        concept_ids = [c["concept_id"] for c in concepts]
+                        lesson = generate_lesson(new_profile)
+                        quiz = generate_quiz(concept_ids=concept_ids, topic=selected_topic, concepts=concepts)
+                        st.session_state["lesson"] = lesson
+                        st.session_state["quiz"] = quiz
+                        st.session_state["is_adaptive"] = False
+                        st.session_state["quiz_attempt"] = 1
+                    set_step("lesson")
+                except LiveAINeededError:
+                    st.error("Live AI is needed for this topic. Try Python loops.")
+                except Exception as e:
+                    from llm import is_python_loops_topic
+                    if not is_python_loops_topic(selected_topic):
+                        st.error("Live AI is needed for this topic. Try Python loops.")
+                    else:
+                        st.error(f"Error generating lesson: {e}")
 
     with col_right:
         st.markdown(
@@ -306,13 +322,14 @@ def render_form_screen():
             unsafe_allow_html=True,
         )
 
-        mastery_map = db.get_all_mastery()
+        cur_topic_for_mastery = st.session_state.get("topic_input", profile.topic or "Python loops")
+        mastery_map = db.get_all_mastery(topic=cur_topic_for_mastery)
         if mastery_map:
             st.markdown(
                 textwrap.dedent(
-                    """
+                    f"""
                     <div class="lm-card">
-                        <h4 style="color:#fcd34d; margin-top:0;">📊 Current Concept Mastery (SQLite)</h4>
+                        <h4 style="color:#fcd34d; margin-top:0;">📊 Current Concept Mastery ({cur_topic_for_mastery})</h4>
                     </div>
                     """
                 ),
@@ -343,29 +360,32 @@ def render_lesson_screen():
     st.markdown(styles.render_header(profile), unsafe_allow_html=True)
     st.markdown(styles.render_stepper(2), unsafe_allow_html=True)
 
-    # What Changed Banner on Adaptive Lesson
-    if is_adaptive and result and result.next_focus:
-        st.markdown(
-            textwrap.dedent(
-                f"""
-                <div class="lm-card" style="border: 2px solid #818cf8; background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(15, 23, 42, 0.9) 100%); margin-bottom: 20px;">
-                    <div style="display:flex; align-items:center; gap:10px; margin-bottom: 6px;">
-                        <span style="font-size: 20px;">🧠</span>
-                        <h3 style="margin:0; color:#a5b4fc; font-size:18px;">What Changed: Adaptive Remedial Focus</h3>
+    # What Changed Banner & "Your Mistake" Box on Adaptive / Weak Concept Lesson
+    if (is_adaptive or lesson.weak_concept):
+        if result and result.next_focus:
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div class="lm-card" style="border: 2px solid #818cf8; background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(15, 23, 42, 0.9) 100%); margin-bottom: 20px;">
+                        <div style="display:flex; align-items:center; gap:10px; margin-bottom: 6px;">
+                            <span style="font-size: 20px;">🧠</span>
+                            <h3 style="margin:0; color:#a5b4fc; font-size:18px;">What Changed: Adaptive Remedial Focus</h3>
+                        </div>
+                        <p style="color:#f8fafc; font-size:14px; margin-bottom:0; line-height:1.6;">
+                            {result.next_focus}
+                        </p>
                     </div>
-                    <p style="color:#f8fafc; font-size:14px; margin-bottom:0; line-height:1.6;">
-                        {result.next_focus}
-                    </p>
-                </div>
-                """
-            ),
-            unsafe_allow_html=True,
-        )
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
 
         # "Your Mistake" Box showing what the user got wrong and why
-        if result.details:
+        rendered_mistake = False
+        if result and result.details:
             wrong_items = [d for d in result.details if not d.get("is_correct")]
             if wrong_items:
+                rendered_mistake = True
                 for w in wrong_items:
                     st.markdown(
                         textwrap.dedent(
@@ -389,6 +409,26 @@ def render_lesson_screen():
                         ),
                         unsafe_allow_html=True,
                     )
+        if not rendered_mistake and lesson.weak_concept:
+            st.markdown(
+                textwrap.dedent(
+                    f"""
+                    <div class="lm-card lm-card-danger" style="margin-bottom: 16px;">
+                        <div class="lm-weak-pulse" style="margin-bottom: 6px;">
+                            <span>⚠️</span> Your Mistake / Weak Concept Remediation
+                        </div>
+                        <h4 style="color: #f87171; margin-top: 4px; margin-bottom: 8px;">Focus Concept: <code>{lesson.weak_concept}</code></h4>
+                        <p style="color: #cbd5e1; font-size: 13.5px; margin-bottom: 6px;">
+                            The adaptive engine diagnosed low concept mastery on <b>{lesson.weak_concept}</b>.
+                        </p>
+                        <p style="color: #38bdf8; font-size: 13px; margin-bottom: 0;">
+                            💡 <b>Pedagogical Adjustment:</b> This remedial lesson breaks down <code>{lesson.weak_concept}</code> step-by-step using an alternative pedagogical method (analogy, execution trace, and visual stepper) to resolve misconceptions.
+                        </p>
+                    </div>
+                    """
+                ),
+                unsafe_allow_html=True,
+            )
 
     # Lesson Overview Banner (clean, flush-left HTML without stray tags)
     sum_minutes = sum(sec.minutes for sec in lesson.sections)
@@ -397,6 +437,14 @@ def render_lesson_screen():
         if is_adaptive
         else '<span class="lm-badge" style="background:rgba(56, 189, 248, 0.2); color:#38bdf8;">📖 Standard Sprint</span>'
     )
+    badge_label = getattr(lesson, "source", None) or "Live AI"
+    badge_styles = {
+        "Live AI": "background:rgba(16, 185, 129, 0.2); color:#34d399; border: 1px solid rgba(16, 185, 129, 0.5);",
+        "Cached": "background:rgba(56, 189, 248, 0.2); color:#38bdf8; border: 1px solid rgba(56, 189, 248, 0.5);",
+        "Fallback": "background:rgba(245, 158, 11, 0.2); color:#fbbf24; border: 1px solid rgba(245, 158, 11, 0.5);",
+    }
+    badge_style = badge_styles.get(badge_label, badge_styles["Live AI"])
+    badge_tag = f'<span class="lm-badge" style="{badge_style}">⚡ {badge_label}</span>'
     focus_text = f" | Focus Area: <b>{lesson.weak_concept}</b>" if lesson.weak_concept else ""
 
     st.markdown(
@@ -404,7 +452,10 @@ def render_lesson_screen():
             f"""
             <div class="lm-card lm-card-highlight">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                    {adaptive_tag}
+                    <div style="display:flex; gap:8px; align-items:center;">
+                        {adaptive_tag}
+                        {badge_tag}
+                    </div>
                     <span class="lm-badge lm-badge-timer">⏱️ Total: {lesson.total_minutes} min Budget ({len(lesson.sections)} sections sum: {sum_minutes} min)</span>
                 </div>
                 <h2 style="color: #ffffff; margin-top: 0; font-size: 24px;">{lesson.topic}</h2>
@@ -539,8 +590,9 @@ def render_quiz_screen():
                 Answer(question_id=qid, selected_index=idx)
                 for qid, idx in submitted_choices.items()
             ]
+            active_topic = quiz.topic if quiz else (profile.topic or "Python loops")
             with st.spinner("Scoring against correct_index & updating SQLite mastery EMA..."):
-                result = submit_answers(answers)
+                result = submit_answers(answers, topic=active_topic)
                 st.session_state["result"] = result
             set_step("feedback")
 
@@ -667,10 +719,11 @@ def render_feedback_screen():
     col_adapt_btn, col_reset_btn = st.columns([1.2, 0.8])
     with col_adapt_btn:
         if st.button("🚀 Start Adaptive Lesson", key="btn_start_adaptive_lesson", type="primary"):
+            active_topic = profile.topic or (st.session_state.get("lesson").topic if st.session_state.get("lesson") else "Python loops")
             with st.spinner("Generating adaptive remedial lesson tailored to diagnosed weak concept..."):
                 adaptive_lesson = generate_lesson(profile, weak_concept=result.weak_concept)
-                quiz_concepts = [result.weak_concept] if result.weak_concept else ["range_bounds", "loop_body"]
-                adaptive_quiz = generate_quiz(concept_ids=quiz_concepts)
+                quiz_concepts = [result.weak_concept] if result.weak_concept else (st.session_state.get("quiz").concept_ids if st.session_state.get("quiz") else ["range_bounds", "loop_body"])
+                adaptive_quiz = generate_quiz(concept_ids=quiz_concepts, topic=active_topic)
                 st.session_state["lesson"] = adaptive_lesson
                 st.session_state["quiz"] = adaptive_quiz
                 st.session_state["is_adaptive"] = True

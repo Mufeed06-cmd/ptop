@@ -35,19 +35,20 @@ class LearningEngine:
         return min(below_threshold.keys(), key=lambda cid: below_threshold[cid])
 
     @staticmethod
-    def generate_next_focus(weak_concept: Optional[str]) -> str:
+    def generate_next_focus(weak_concept: Optional[str], topic: str = "Python loops") -> str:
         """
         next_focus = a one-line string explaining what the next lesson will focus on.
         """
         if weak_concept:
             return f"The next lesson will focus on mastering '{weak_concept}' using step-by-step trace explanations."
-        return "The next lesson will focus on advanced loop structures, nested iterations, and optimization patterns."
+        return f"The next lesson will focus on advanced {topic} concepts, practical patterns, and consolidation."
 
     def score_and_update(
         self,
         answers: list[Answer],
         questions_dict: dict[str, Question],
         session_id: Optional[str] = None,
+        topic: str = "Python loops",
     ) -> Result:
         """
         Scores answers against question.correct_index,
@@ -93,10 +94,13 @@ class LearningEngine:
                 outcome=outcome,
             )
 
+            # Determine topic for this concept
+            q_topic = getattr(q, "topic", None) or topic
+
             # Update concept mastery in SQLite: mastery += 0.3 * (outcome - mastery)
-            current_mastery = db.get_mastery(q.concept_id)
+            current_mastery = db.get_mastery(q.concept_id, topic=q_topic)
             updated_mastery = self.calculate_mastery_update(current_mastery, outcome)
-            db.update_mastery(q.concept_id, updated_mastery)
+            db.update_mastery(q.concept_id, updated_mastery, topic=q_topic)
 
             correct_text = q.options[q.correct_index] if 0 <= q.correct_index < len(q.options) else q.correct_answer
 
@@ -112,10 +116,10 @@ class LearningEngine:
                 "explanation": q.explanation,
             })
 
-        all_masteries = db.get_all_mastery()
+        all_masteries = db.get_all_mastery(topic=topic)
         weak_concept = self.determine_weak_concept(all_masteries)
         weak_concepts = [cid for cid, m in all_masteries.items() if m < 0.6]
-        next_focus = self.generate_next_focus(weak_concept)
+        next_focus = self.generate_next_focus(weak_concept, topic=topic)
 
         percentage = round((score / total) * 100, 1) if total > 0 else 0.0
         passed = percentage >= 60.0
