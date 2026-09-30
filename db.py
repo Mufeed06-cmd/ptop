@@ -1,88 +1,192 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Optional
-from schemas import Profile, Lesson, Result
+from schemas import Question, Profile
 
 
-DB_FILE = Path(__file__).parent / "learnmate_db.json"
+DB_PATH = Path(__file__).parent / "learnmate.db"
 
 
-class LocalDatabase:
-    """Lightweight JSON-backed local storage for LearnMate sessions and records."""
+def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    """Returns a SQLite connection with row_factory enabled."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def __init__(self, db_path: Path = DB_FILE):
-        self.db_path = db_path
-        self._profiles: dict[str, dict] = {}
-        self._lessons: dict[str, dict] = {}
-        self._results: list[dict] = []
-        self._load()
 
-    def _load(self) -> None:
-        if self.db_path.exists():
-            try:
-                with open(self.db_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self._profiles = data.get("profiles", {})
-                    self._lessons = data.get("lessons", {})
-                    self._results = data.get("results", [])
-            except Exception:
-                # If file is corrupted or unreadable, start fresh
-                self._profiles = {}
-                self._lessons = {}
-                self._results = []
+def init_db(db_path: Path = DB_PATH) -> None:
+    """
+    Initializes SQLite tables:
+    - sessions
+    - questions
+    - attempts
+    - mastery(concept_id, score default 0.5)
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                topic TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-    def _save(self) -> None:
-        data = {
-            "profiles": self._profiles,
-            "lessons": self._lessons,
-            "results": self._results,
-        }
-        with open(self.db_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            CREATE TABLE IF NOT EXISTS questions (
+                id TEXT PRIMARY KEY,
+                concept_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL,
+                correct_index INTEGER NOT NULL,
+                explanation TEXT,
+                session_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
 
-    # --- Profile Operations ---
-    def save_profile(self, profile: Profile) -> None:
-        self._profiles[profile.user_id] = profile.model_dump()
-        self._save()
+            CREATE TABLE IF NOT EXISTS attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                question_id TEXT NOT NULL,
+                selected_index INTEGER NOT NULL,
+                outcome REAL NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id),
+                FOREIGN KEY (question_id) REFERENCES questions(id)
+            );
 
-    def get_profile(self, user_id: str) -> Optional[Profile]:
-        data = self._profiles.get(user_id)
-        if data:
-            return Profile.model_validate(data)
-        return None
+            CREATE TABLE IF NOT EXISTS mastery (
+                concept_id TEXT PRIMARY KEY,
+                score REAL DEFAULT 0.5
+            );
+            """
+        )
+        conn.commit()
 
-    # --- Lesson Operations ---
-    def save_lesson(self, lesson: Lesson) -> None:
-        self._lessons[lesson.id] = lesson.model_dump()
-        self._save()
 
-    def get_lesson(self, lesson_id: str) -> Optional[Lesson]:
-        data = self._lessons.get(lesson_id)
-        if data:
-            return Lesson.model_validate(data)
-        return None
+# Initialize tables upon module load
+init_db()
 
-    def get_latest_lesson(self) -> Optional[Lesson]:
-        if not self._lessons:
+
+def save_session(session_id: str, user_id: str, topic: str = "Python Loops") -> None:
+    """Inserts or replaces a session entry."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, user_id, topic) VALUES (?, ?, ?)",
+            (session_id, user_id, topic),
+        )
+        conn.commit()
+
+
+def save_question(q: Question, session_id: Optional[str] = None) -> None:
+    """Saves or updates a question in the SQLite database."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO questions 
+            (id, concept_id, question, options, correct_index, explanation, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                q.id,
+                q.concept_id,
+                q.question,
+                json.dumps(q.options),
+                q.correct_index,
+                q.explanation,
+                session_id,
+            ),
+        )
+        conn.commit()
+
+
+def save_questions(questions: list[Question], session_id: Optional[str] = None) -> None:
+    """Batch saves questions."""
+    for q in questions:
+        save_question(q, session_id=session_id)
+
+
+def get_question(question_id: str) -> Optional[Question]:
+    """Retrieves a question by its id from SQLite."""
+    with get_connection() as conn:
+        cursor = conn.execute("SELECT * FROM questions WHERE id = ?", (question_id,))
+        row = cursor.fetchone()
+        if not row:
             return None
-        last_item = list(self._lessons.values())[-1]
-        return Lesson.model_validate(last_item)
-
-    # --- Result Operations ---
-    def save_result(self, result: Result) -> None:
-        self._results.append(result.model_dump())
-        self._save()
-
-    def get_results(self) -> list[Result]:
-        return [Result.model_validate(r) for r in self._results]
-
-    def get_latest_result(self) -> Optional[Result]:
-        if not self._results:
-            return None
-        return Result.model_validate(self._results[-1])
+        return Question(
+            id=row["id"],
+            concept_id=row["concept_id"],
+            question=row["question"],
+            options=json.loads(row["options"]),
+            correct_index=row["correct_index"],
+            explanation=row["explanation"] or "",
+        )
 
 
-# Global database instance
-db = LocalDatabase()
+def record_attempt(
+    session_id: Optional[str],
+    question_id: str,
+    selected_index: int,
+    outcome: float,
+) -> None:
+    """Inserts an attempt record into the attempts table."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO attempts (session_id, question_id, selected_index, outcome)
+            VALUES (?, ?, ?, ?)
+            """,
+            (session_id, question_id, selected_index, outcome),
+        )
+        conn.commit()
+
+
+def get_mastery(concept_id: str) -> float:
+    """
+    Retrieves the current mastery score for a concept.
+    Defaults to 0.5 if not previously recorded.
+    """
+    with get_connection() as conn:
+        cursor = conn.execute("SELECT score FROM mastery WHERE concept_id = ?", (concept_id,))
+        row = cursor.fetchone()
+        if row is not None:
+            return float(row["score"])
+        # If not present, initialize with default 0.5
+        conn.execute("INSERT OR IGNORE INTO mastery (concept_id, score) VALUES (?, 0.5)", (concept_id,))
+        conn.commit()
+        return 0.5
+
+
+def update_mastery(concept_id: str, new_score: float) -> None:
+    """Sets or updates the mastery score for a concept."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO mastery (concept_id, score) VALUES (?, ?) ON CONFLICT(concept_id) DO UPDATE SET score = excluded.score",
+            (concept_id, new_score),
+        )
+        conn.commit()
+
+
+def get_all_mastery() -> dict[str, float]:
+    """Returns all concept mastery scores."""
+    with get_connection() as conn:
+        cursor = conn.execute("SELECT concept_id, score FROM mastery")
+        return {row["concept_id"]: float(row["score"]) for row in cursor.fetchall()}
+
+
+def reset_db() -> None:
+    """Clears all table contents (useful for testing)."""
+    with get_connection() as conn:
+        conn.executescript(
+            """
+            DELETE FROM attempts;
+            DELETE FROM questions;
+            DELETE FROM sessions;
+            DELETE FROM mastery;
+            """
+        )
+        conn.commit()

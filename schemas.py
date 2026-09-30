@@ -12,6 +12,7 @@ class Profile(BaseModel):
     name: str = "Learner"
     skill_level: str = "beginner"
     minutes: int = 15
+    language: str = "English"
     weak_concepts: list[str] = Field(default_factory=list)
     preferences: dict[str, Any] = Field(default_factory=dict)
 
@@ -38,6 +39,7 @@ class Lesson(BaseModel):
     total_minutes: int
     sections: list[LessonSection]
     weak_concept: Optional[str] = None
+    language: str = "English"
 
 
 class Question(BaseModel):
@@ -48,8 +50,18 @@ class Question(BaseModel):
     concept_id: str  # e.g., "range_bounds", "loop_body"
     question: str
     options: list[str]
-    correct_answer: str
+    correct_index: int
+    correct_answer: Optional[str] = None
     explanation: str
+
+    @model_validator(mode="after")
+    def sync_answers(self) -> Question:
+        if self.options and 0 <= self.correct_index < len(self.options):
+            if not self.correct_answer:
+                self.correct_answer = self.options[self.correct_index]
+        elif self.correct_answer and self.options and self.correct_answer in self.options:
+            self.correct_index = self.options.index(self.correct_answer)
+        return self
 
 
 class Quiz(BaseModel):
@@ -67,13 +79,16 @@ class Answer(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     question_id: str
-    selected_answer: str
+    selected_index: int = -1
+    selected_answer: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
     def populate_alias_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            # Allow 'selected_option' or 'answer' as fallback aliases
+            if "selected_index" not in data:
+                if "index" in data:
+                    data["selected_index"] = data["index"]
             if "selected_answer" not in data:
                 if "selected_option" in data:
                     data["selected_answer"] = data["selected_option"]
@@ -92,4 +107,7 @@ class Result(BaseModel):
     passed: bool
     feedback: str
     weak_concepts: list[str] = Field(default_factory=list)
+    weak_concept: Optional[str] = None
+    next_focus: Optional[str] = None
+    mastery_scores: dict[str, float] = Field(default_factory=dict)
     details: list[dict[str, Any]] = Field(default_factory=list)
