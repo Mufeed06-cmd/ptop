@@ -278,16 +278,20 @@ class TestLearnMateRealLogic(unittest.TestCase):
         """Requirement 7: If no API key or Gemini fails for new topic, raise LiveAINeededError. Python loops keeps working offline."""
         from llm import LiveAINeededError
 
-        # New topic fails when Gemini fails
-        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+        # New topic fails when live AI fails (Gemini and Groq fallback both fail)
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call, \
+             patch.object(llm_service, "_call_groq_raw") as mock_groq:
             mock_call.side_effect = RuntimeError("Network error")
+            mock_groq.side_effect = RuntimeError("Groq offline")
             with self.assertRaises(LiveAINeededError) as ctx:
                 generate_lesson(Profile(name="Student", topic="Photosynthesis", minutes=15))
             self.assertIn("Live AI is needed for this topic. Try Python loops.", str(ctx.exception))
 
         # Python loops keeps working offline with fallback
-        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call, \
+             patch.object(llm_service, "_call_groq_raw") as mock_groq:
             mock_call.side_effect = RuntimeError("Offline")
+            mock_groq.side_effect = RuntimeError("Groq offline")
             lesson = generate_lesson(Profile(name="Student", topic="Python loops", minutes=15))
             self.assertIsNotNone(lesson)
             self.assertEqual(len(lesson.sections), 6)
@@ -296,8 +300,10 @@ class TestLearnMateRealLogic(unittest.TestCase):
     def test_badge_and_lesson_caching(self):
         """Requirement 8: Show badge Live AI, Cached, or Fallback. Cache by topic+level+language+minutes+weak_concept in cache/."""
         # 1. Fallback badge
-        with patch.object(llm_service, "_call_gemini_raw") as mock_call:
+        with patch.object(llm_service, "_call_gemini_raw") as mock_call, \
+             patch.object(llm_service, "_call_groq_raw") as mock_groq:
             mock_call.side_effect = RuntimeError("Simulate offline")
+            mock_groq.side_effect = RuntimeError("Groq offline")
             fallback_lesson = llm_service.generate_lesson_llm(Profile(topic="Python loops", minutes=15))
             self.assertEqual(fallback_lesson.source, "Fallback")
 
@@ -360,6 +366,17 @@ class TestLearnMateRealLogic(unittest.TestCase):
             key = get_gemini_api_key()
             self.assertEqual(key, "AIzaSySingleQuotesKey")
 
+        # Test GOOGLE_API_KEY fallback
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "AIzaSyGoogleKey123"}):
+            key = get_gemini_api_key()
+            self.assertEqual(key, "AIzaSyGoogleKey123")
+
+        # Test nested secrets dictionary extraction
+        from llm import _extract_key_from_dict_or_secrets
+        nested_secrets = {"gemini": {"api_key": "AIzaSyNestedTableKey"}}
+        extracted = _extract_key_from_dict_or_secrets(nested_secrets)
+        self.assertEqual(extracted, "AIzaSyNestedTableKey")
+
     def test_sanitize_error_redacts_keys(self):
         """Never print or expose the API key in logs or debug expander."""
         from llm import sanitize_error
@@ -395,6 +412,78 @@ class TestLearnMateRealLogic(unittest.TestCase):
                 success, msg = llm_service.test_connection()
                 self.assertTrue(success)
                 self.assertEqual(msg, "Success")
+
+    def test_gemini_success_does_not_call_groq(self):
+        """When Gemini succeeds, Groq must NOT be called."""
+        sample_lesson = get_fallback_lesson(Profile(topic="Python loops", minutes=15))
+        with patch.object(llm_service, "_call_gemini_raw", return_value=sample_lesson.model_dump_json()) as mock_gemini, \
+             patch.object(llm_service, "_call_groq_raw") as mock_groq:
+            p = Profile(name="Tester", topic="Python loops", minutes=15)
+            lesson = llm_service.generate_lesson_llm(p)
+            self.assertEqual(mock_gemini.call_count, 1)
+            self.assertEqual(mock_groq.call_count, 0)
+            self.assertEqual(lesson.source, "Live AI")
+
+    def test_gemini_rate_limit_or_api_error_triggers_groq_fallback(self):
+        """When Gemini returns a rate-limit/API error, automatically try Groq for lesson generation."""
+        sample_lesson = get_fallback_lesson(Profile(topic="Python loops", minutes=15))
+        with patch.object(llm_service, "_call_gemini_raw", side_effect=RuntimeError("429 ResourceExhausted: Rate limit exceeded")) as mock_gemini, \
+             patch.object(llm_service, "_call_groq_raw", return_value=sample_lesson.model_dump_json()) as mock_groq:
+            p = Profile(name="Tester", topic="Python loops", minutes=15)
+            lesson = llm_service.generate_lesson_llm(p)
+            self.assertEqual(mock_gemini.call_count, 1)
+            self.assertEqual(mock_groq.call_count, 1)
+            self.assertEqual(lesson.source, "Live AI")
+
+    def test_groq_fallback_for_concepts_and_quiz(self):
+        """When Gemini returns rate-limit/API errors, Groq handles concepts and quiz generation."""
+        sample_concepts = [
+            {"concept_id": "qubits", "name": "Qubits", "common_mistake": "Assuming qubits are binary bits"},
+            {"concept_id": "superposition", "name": "Superposition", "common_mistake": "Confusing superposition with probability"},
+            {"concept_id": "entanglement", "name": "Entanglement", "common_mistake": "Thinking entanglement enables FTL communication"},
+        ]
+        # 1. Concepts fallback
+        with patch.object(llm_service, "_call_gemini_raw", side_effect=RuntimeError("503 Service Unavailable")) as mock_gemini, \
+             patch.object(llm_service, "_call_groq_raw", return_value=json.dumps(sample_concepts)) as mock_groq:
+            concepts = llm_service.generate_concepts("Quantum Mechanics", level="beginner")
+            self.assertEqual(mock_gemini.call_count, 1)
+            self.assertEqual(mock_groq.call_count, 1)
+            self.assertEqual(len(concepts), 3)
+
+        # 2. Quiz fallback
+        valid_quiz = get_fallback_quiz(["qubits", "superposition"])
+        with patch.object(llm_service, "_call_gemini_raw", side_effect=RuntimeError("429 RateLimit")) as mock_gemini, \
+             patch.object(llm_service, "_call_groq_raw", return_value=valid_quiz.model_dump_json()) as mock_groq:
+            quiz = llm_service.generate_quiz_llm(["qubits", "superposition"], topic="Quantum Mechanics", concepts=sample_concepts)
+            self.assertEqual(mock_gemini.call_count, 1)
+            self.assertEqual(mock_groq.call_count, 1)
+            self.assertEqual(quiz.source, "Live AI")
+            self.assertEqual(len(quiz.questions), 5)
+
+    def test_groq_key_extraction_and_sanitization(self):
+        """Verify get_groq_api_key handles whitespace, quotes, secrets, and sanitizes keys."""
+        from llm import get_groq_api_key, _extract_groq_key_from_dict_or_secrets, sanitize_error
+
+        # Placeholder ignored
+        with patch.dict(os.environ, {"GROQ_API_KEY": "paste_your_key_here"}):
+            self.assertIsNone(get_groq_api_key())
+
+        # Whitespace and quotes stripped
+        with patch.dict(os.environ, {"GROQ_API_KEY": '  "gsk_TestApiKey1234567890abcdef"  '}):
+            key = get_groq_api_key()
+            self.assertEqual(key, "gsk_TestApiKey1234567890abcdef")
+
+        # Nested secrets dictionary extraction
+        nested_secrets = {"groq": {"api_key": "gsk_NestedTableKey1234567890abcdef"}}
+        extracted = _extract_groq_key_from_dict_or_secrets(nested_secrets)
+        self.assertEqual(extracted, "gsk_NestedTableKey1234567890abcdef")
+
+        # Key sanitization
+        with patch.dict(os.environ, {"GROQ_API_KEY": "gsk_SecretKey1234567890abcdef"}):
+            err_msg = "Error with key gsk_SecretKey1234567890abcdef on api.groq.com"
+            sanitized = sanitize_error(err_msg)
+            self.assertNotIn("gsk_SecretKey1234567890abcdef", sanitized)
+            self.assertIn("[REDACTED_API_KEY]", sanitized)
 
 
 if __name__ == "__main__":

@@ -348,36 +348,106 @@ def is_python_loops_topic(topic: Optional[str]) -> bool:
     return ("python" in t and "loop" in t) or t in ["python loops", "python - loops", "loops"]
 
 
+def _extract_key_from_dict_or_secrets(data: Any) -> Optional[str]:
+    """Recursively searches a dictionary, mapping, or Streamlit Secrets object for a Gemini/Google API key."""
+    if not data:
+        return None
+    candidates = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key", "google_api_key", "GEMINI_KEY", "API_KEY"]
+    try:
+        # 1. Direct candidate lookups
+        for c in candidates:
+            try:
+                if c in data and isinstance(data[c], str) and data[c].strip():
+                    return data[c]
+            except Exception:
+                pass
+            try:
+                if hasattr(data, "get"):
+                    v = data.get(c)
+                    if isinstance(v, str) and v.strip():
+                        return v
+            except Exception:
+                pass
+
+        # 2. Iterate keys (handling nested tables like [gemini] api_key = "...")
+        if isinstance(data, dict) or hasattr(data, "items"):
+            for k, val in data.items():
+                k_str = str(k).lower().strip()
+                if isinstance(val, str) and val.strip():
+                    if any(cand.lower() == k_str for cand in candidates) or (("gemini" in k_str or "google" in k_str) and "key" in k_str):
+                        return val
+                elif isinstance(val, (dict, list)) or hasattr(val, "items"):
+                    found = _extract_key_from_dict_or_secrets(val)
+                    if found:
+                        return found
+    except Exception:
+        pass
+    return None
+
+
 def get_gemini_api_key() -> Optional[str]:
     """
     Retrieves the Gemini API key from:
-    1. st.secrets["GEMINI_API_KEY"] (if running in Streamlit with secrets configured)
-    2. os.getenv("GEMINI_API_KEY") (or os.environ.get("GEMINI_API_KEY"))
+    1. st.session_state (if user entered it in sidebar input during local run)
+    2. st.secrets (supporting GEMINI_API_KEY, GOOGLE_API_KEY, lowercase, and nested tables like [gemini] api_key)
+    3. os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    4. Local .env file if present
     Strips any whitespace or surrounding quotes (' or ").
     Returns None if missing or placeholder. Never prints the key.
     """
     raw_key: Optional[str] = None
 
-    # Check Streamlit secrets first
+    # 1. Check Streamlit session state first (user-entered key for local testing)
     try:
         import streamlit as st
-        try:
-            if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-                raw_key = st.secrets["GEMINI_API_KEY"]
-        except Exception:
-            pass
-        if not raw_key:
-            try:
-                if hasattr(st, "secrets") and hasattr(st.secrets, "get"):
-                    raw_key = st.secrets.get("GEMINI_API_KEY")
-            except Exception:
-                pass
+        if hasattr(st, "session_state"):
+            for sess_k in ["custom_api_key", "input_custom_gemini_key", "user_api_key"]:
+                if sess_k in st.session_state and st.session_state[sess_k]:
+                    val = str(st.session_state[sess_k]).strip()
+                    if val and val != "paste_your_key_here":
+                        raw_key = val
+                        break
     except Exception:
         pass
 
-    # Fall back to environment variable
+    # 2. Check Streamlit secrets (exhaustive search)
     if not raw_key:
-        raw_key = os.getenv("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets"):
+                raw_key = _extract_key_from_dict_or_secrets(st.secrets)
+        except Exception:
+            pass
+
+    # 3. Check environment variables (GEMINI_API_KEY, then GOOGLE_API_KEY)
+    if not raw_key:
+        raw_key = (
+            os.getenv("GEMINI_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
+
+    # 4. Check local .env file if it exists
+    if not raw_key:
+        try:
+            env_file = Path(__file__).parent / ".env"
+            if env_file.exists():
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k_clean = k.strip().upper()
+                            if k_clean in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+                                cand_v = v.strip()
+                                if cand_v and cand_v != "paste_your_key_here":
+                                    raw_key = cand_v
+                                    break
+        except Exception:
+            pass
 
     if not raw_key:
         return None
@@ -393,19 +463,156 @@ def get_gemini_api_key() -> Optional[str]:
     if not key or key == "paste_your_key_here":
         return None
 
-    # Also synchronize to os.environ so any underlying SDK/subprocesses have it
+    # Synchronize to os.environ so any underlying SDK/subprocesses have it
     os.environ["GEMINI_API_KEY"] = key
+    os.environ["GOOGLE_API_KEY"] = key
+    return key
+
+
+def _extract_groq_key_from_dict_or_secrets(data: Any, parent_key: str = "") -> Optional[str]:
+    """Recursively searches a dictionary, mapping, or Streamlit Secrets object for a Groq API key."""
+    if not data:
+        return None
+    candidates = ["GROQ_API_KEY", "groq_api_key", "GROQ_KEY", "groq_key"]
+    if "groq" in parent_key.lower():
+        candidates.extend(["api_key", "key", "API_KEY", "KEY"])
+    try:
+        # 1. Direct candidate lookups
+        for c in candidates:
+            try:
+                if c in data and isinstance(data[c], str) and data[c].strip():
+                    v = data[c].strip()
+                    if v != "paste_your_key_here":
+                        return v
+            except Exception:
+                pass
+            try:
+                if hasattr(data, "get"):
+                    v = data.get(c)
+                    if isinstance(v, str) and v.strip() and v.strip() != "paste_your_key_here":
+                        return v.strip()
+            except Exception:
+                pass
+
+        # 2. Iterate keys (handling nested tables like [groq] api_key = "...")
+        if isinstance(data, dict) or hasattr(data, "items"):
+            for k, val in data.items():
+                k_str = str(k).lower().strip()
+                if isinstance(val, str) and val.strip():
+                    if any(cand.lower() == k_str for cand in candidates) or (("groq" in k_str or "groq" in parent_key.lower()) and "key" in k_str):
+                        if val.strip() != "paste_your_key_here":
+                            return val.strip()
+                elif isinstance(val, (dict, list)) or hasattr(val, "items"):
+                    found = _extract_groq_key_from_dict_or_secrets(val, parent_key=k_str)
+                    if found:
+                        return found
+    except Exception:
+        pass
+    return None
+
+
+def get_groq_api_key() -> Optional[str]:
+    """
+    Retrieves the Groq API key from:
+    1. st.session_state (custom_groq_api_key, groq_api_key, etc.)
+    2. st.secrets (supporting GROQ_API_KEY, groq_api_key, lowercase, and nested tables like [groq] api_key)
+    3. os.getenv("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    4. Local .env file if present
+    Strips any whitespace or surrounding quotes (' or ").
+    Returns None if missing or placeholder. Never prints the key.
+    """
+    raw_key: Optional[str] = None
+
+    # 1. Check Streamlit session state first
+    try:
+        import streamlit as st
+        if hasattr(st, "session_state"):
+            for sess_k in ["custom_groq_api_key", "groq_api_key", "input_custom_groq_key", "user_groq_api_key"]:
+                if sess_k in st.session_state and st.session_state[sess_k]:
+                    val = str(st.session_state[sess_k]).strip()
+                    if val and val != "paste_your_key_here":
+                        raw_key = val
+                        break
+    except Exception:
+        pass
+
+    # 2. Check Streamlit secrets
+    if not raw_key:
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets"):
+                raw_key = _extract_groq_key_from_dict_or_secrets(st.secrets)
+        except Exception:
+            pass
+
+    # 3. Check environment variables
+    if not raw_key:
+        raw_key = os.getenv("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+
+    # 4. Check local .env file if it exists
+    if not raw_key:
+        try:
+            env_file = Path(__file__).parent / ".env"
+            if env_file.exists():
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k_clean = k.strip().upper()
+                            if k_clean in ["GROQ_API_KEY", "GROQ_KEY"]:
+                                cand_v = v.strip()
+                                if cand_v and cand_v != "paste_your_key_here":
+                                    raw_key = cand_v
+                                    break
+        except Exception:
+            pass
+
+    if not raw_key:
+        return None
+
+    # Strip whitespace
+    key = str(raw_key).strip()
+
+    # Strip single or double quotes at the ends
+    if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
+        key = key[1:-1].strip()
+    key = key.strip("\"' \t\r\n")
+
+    if not key or key == "paste_your_key_here":
+        return None
+
+    os.environ["GROQ_API_KEY"] = key
     return key
 
 
 def sanitize_error(err: Any) -> str:
     """Removes any API keys from error messages before logging or rendering."""
     msg = str(err)
-    key = get_gemini_api_key()
-    if key and key in msg:
-        msg = msg.replace(key, "[REDACTED_API_KEY]")
-    msg = re.sub(r'AIza[0-9A-Za-z-_]{35}', '[REDACTED_API_KEY]', msg)
+    gem_key = get_gemini_api_key()
+    if gem_key and gem_key in msg:
+        msg = msg.replace(gem_key, "[REDACTED_API_KEY]")
+    groq_key = get_groq_api_key()
+    if groq_key and groq_key in msg:
+        msg = msg.replace(groq_key, "[REDACTED_API_KEY]")
+    msg = re.sub(r'AIza[0-9A-Za-z_-]{30,}', '[REDACTED_API_KEY]', msg)
+    msg = re.sub(r'AQ\.[0-9A-Za-z_-]{30,}', '[REDACTED_API_KEY]', msg)
+    msg = re.sub(r'gsk_[0-9A-Za-z]{20,}', '[REDACTED_API_KEY]', msg)
     return msg
+
+
+def _clean_json_text(raw: str) -> str:
+    """Strips markdown code fences like ```json ... ``` from LLM text if present."""
+    text = raw.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
 
 
 class LiveAINeededError(Exception):
@@ -570,9 +777,14 @@ class LLMService:
     def __init__(self):
         self._genai = None
         self._model = None
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self._setup_error: Optional[str] = None
         self._setup_client()
+
+        self._groq_client = None
+        self.groq_model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+        self._groq_setup_error: Optional[str] = None
+        self._setup_groq_client()
 
     def _setup_client(self) -> None:
         api_key = get_gemini_api_key()
@@ -585,7 +797,7 @@ class LLMService:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
             self._genai = genai
-            self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+            self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
             generation_config = genai.GenerationConfig(
                 response_mime_type="application/json",
                 temperature=0.3,
@@ -600,10 +812,32 @@ class LLMService:
             self._setup_error = sanitize_error(f"{type(e).__name__}: {str(e)}")
             print(f"[LearnMate LOG] Failed to setup Gemini client: {self._setup_error}", flush=True)
 
+    def _setup_groq_client(self) -> None:
+        api_key = get_groq_api_key()
+        if not api_key:
+            self._groq_client = None
+            self._groq_setup_error = "GROQ_API_KEY is not configured or is a placeholder in st.secrets / os.environ / .env."
+            return
+
+        try:
+            from groq import Groq
+            self._groq_client = Groq(api_key=api_key)
+            self.groq_model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+            self._groq_setup_error = None
+        except Exception as e:
+            self._groq_client = None
+            self._groq_setup_error = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Failed to setup Groq client: {self._groq_setup_error}", flush=True)
+
     @property
     def is_configured(self) -> bool:
         api_key = get_gemini_api_key()
         return bool(api_key) and self._model is not None
+
+    @property
+    def is_groq_configured(self) -> bool:
+        api_key = get_groq_api_key()
+        return bool(api_key) and self._groq_client is not None
 
     def test_connection(self) -> tuple[bool, str]:
         """Performs a small test call to Gemini, returning (success, message). Never leaks keys."""
@@ -620,11 +854,32 @@ class LLMService:
         try:
             # Send a tiny prompt to verify connectivity & JSON mode
             raw = self._call_gemini_raw('Respond with JSON: {"status": "ok"}')
-            json.loads(raw.strip())
+            json.loads(_clean_json_text(raw))
             return True, "Success"
         except Exception as e:
             sanitized = sanitize_error(f"{type(e).__name__}: {str(e)}")
             print(f"[LearnMate LOG] Gemini test connection failed: {sanitized}", flush=True)
+            return False, sanitized
+
+    def test_groq_connection(self) -> tuple[bool, str]:
+        """Performs a small test call to Groq, returning (success, message). Never leaks keys."""
+        api_key = get_groq_api_key()
+        if not api_key:
+            return False, "GROQ_API_KEY is not configured or is a placeholder."
+
+        if not self._groq_client:
+            self._setup_groq_client()
+
+        if not self._groq_client:
+            return False, self._groq_setup_error or "Groq client could not be initialized."
+
+        try:
+            raw = self._call_groq_raw('Respond with JSON: {"status": "ok"}')
+            json.loads(_clean_json_text(raw))
+            return True, "Success"
+        except Exception as e:
+            sanitized = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Groq test connection failed: {sanitized}", flush=True)
             return False, sanitized
 
     def _call_gemini_raw(self, prompt: str) -> str:
@@ -639,16 +894,16 @@ class LLMService:
             return response.text
         except Exception as e:
             err_msg = str(e)
-            if ("not found" in err_msg.lower() or "404" in err_msg) and self.model_name != "gemini-2.0-flash":
-                print(f"[LearnMate LOG] Model {self.model_name} not found. Attempting fallback to gemini-2.0-flash...", flush=True)
+            if ("not found" in err_msg.lower() or "404" in err_msg) and self.model_name != "gemini-3.8-flash":
+                print(f"[LearnMate LOG] Model {self.model_name} not found. Attempting fallback to gemini-3.8-flash...", flush=True)
                 try:
-                    self.model_name = "gemini-2.0-flash"
+                    self.model_name = "gemini-3.8-flash"
                     generation_config = self._genai.GenerationConfig(
                         response_mime_type="application/json",
                         temperature=0.3,
                     )
                     self._model = self._genai.GenerativeModel(
-                        model_name="gemini-2.0-flash",
+                        model_name="gemini-3.8-flash",
                         generation_config=generation_config,
                     )
                     response = self._model.generate_content(prompt)
@@ -661,10 +916,58 @@ class LLMService:
             print(f"[LearnMate LOG] Gemini call failed: {sanitized}", flush=True)
             raise
 
+    def _call_groq_raw(self, prompt: str) -> str:
+        """Invokes Groq with configured temperature 0.3 and JSON response mode."""
+        if not self._groq_client:
+            self._setup_groq_client()
+        if not self._groq_client:
+            raise RuntimeError(f"Groq client is not configured: {self._groq_setup_error or 'missing or invalid GROQ_API_KEY'}")
+
+        prompt_content = prompt if "json" in prompt.lower() else f"{prompt}\nReturn your response as a valid JSON object or JSON array."
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert AI curriculum and assessment designer. Output ONLY valid, parseable JSON conforming strictly to the requested schema. Do NOT include markdown code fences or conversational text outside the JSON.",
+            },
+            {"role": "user", "content": prompt_content},
+        ]
+
+        try:
+            response = self._groq_client.chat.completions.create(
+                model=self.groq_model_name,
+                messages=messages,
+                temperature=0.3,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content or ""
+            return _clean_json_text(content)
+        except Exception as e:
+            err_msg = str(e)
+            if ("not found" in err_msg.lower() or "404" in err_msg) and self.groq_model_name != "openai/gpt-oss-20b":
+                print(f"[LearnMate LOG] Groq model {self.groq_model_name} not found. Attempting fallback to openai/gpt-oss-20b...", flush=True)
+                try:
+                    self.groq_model_name = "openai/gpt-oss-20b"
+                    response = self._groq_client.chat.completions.create(
+                        model="openai/gpt-oss-20b",
+                        messages=messages,
+                        temperature=0.3,
+                        response_format={"type": "json_object"},
+                    )
+                    content = response.choices[0].message.content or ""
+                    return _clean_json_text(content)
+                except Exception as e2:
+                    sanitized2 = sanitize_error(f"{type(e2).__name__}: {str(e2)}")
+                    print(f"[LearnMate LOG] Groq model fallback call failed: {sanitized2}", flush=True)
+                    raise
+            sanitized = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Groq call failed: {sanitized}", flush=True)
+            raise
+
     def generate_concepts(self, topic: str, level: str = "beginner", goal: Optional[str] = None) -> list[dict[str, str]]:
         """
         Generates 3 items {concept_id (snake_case), name, common_mistake} for topic.
-        Uses Gemini JSON mode, validates, retries once on error, caches result.
+        Gemini is primary. Automatically falls back to Groq if Gemini returns an API/rate-limit error.
         """
         topic_clean = topic.strip()
         cached = load_cached_concepts(topic_clean, level, goal)
@@ -690,40 +993,81 @@ Rules:
 2. concept_id must be in snake_case (e.g. inner_join, range_bounds, light_reactions).
 """
 
+        # 1. PRIMARY: Try Gemini
+        gemini_failed = False
+        gemini_err_msg = ""
         try:
             raw_text = self._call_gemini_raw(prompt)
-            data = json.loads(raw_text)
+            data = json.loads(_clean_json_text(raw_text))
             concepts = _validate_concepts_data(data)
             save_cached_concepts(topic_clean, level, goal, concepts)
             return concepts
-        except Exception as first_error:
-            sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
-            print(f"[LearnMate LOG] generate_concepts initial attempt failed: {sanitized_first}", flush=True)
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as val_err:
+            sanitized_val = sanitize_error(f"{type(val_err).__name__}: {str(val_err)}")
+            print(f"[LearnMate LOG] generate_concepts Gemini JSON validation failed: {sanitized_val}. Retrying Gemini...", flush=True)
             try:
                 retry_prompt = (
                     f"{prompt}\n\n"
-                    f"Your previous response failed validation: {sanitized_first}.\n"
+                    f"Your previous response failed validation: {sanitized_val}.\n"
                     "Regenerate strictly valid JSON with exactly 3 objects: concept_id (snake_case), name, common_mistake."
                 )
                 raw_retry = self._call_gemini_raw(retry_prompt)
-                data_retry = json.loads(raw_retry)
+                data_retry = json.loads(_clean_json_text(raw_retry))
                 concepts = _validate_concepts_data(data_retry)
                 save_cached_concepts(topic_clean, level, goal, concepts)
                 return concepts
             except Exception as second_error:
-                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
-                print(f"[LearnMate LOG] generate_concepts retry failed: {sanitized_second}", flush=True)
-                if is_python_loops_topic(topic_clean):
-                    save_cached_concepts(topic_clean, level, goal, PYTHON_LOOPS_CONCEPTS)
-                    return PYTHON_LOOPS_CONCEPTS
-                raise LiveAINeededError(
-                    "Live AI is needed for this topic. Try Python loops.",
-                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
-                )
+                gemini_err_msg = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                print(f"[LearnMate LOG] generate_concepts Gemini retry failed: {gemini_err_msg}", flush=True)
+                gemini_failed = True
+        except Exception as api_err:
+            gemini_err_msg = sanitize_error(f"{type(api_err).__name__}: {str(api_err)}")
+            print(f"[LearnMate LOG] generate_concepts Gemini API/rate-limit error: {gemini_err_msg}. Triggering Groq fallback...", flush=True)
+            gemini_failed = True
+
+        # 2. FALLBACK: Try Groq if Gemini failed
+        if gemini_failed:
+            print(f"[LearnMate LOG] Calling Groq fallback for generate_concepts ({topic_clean})...", flush=True)
+            try:
+                raw_groq = self._call_groq_raw(prompt)
+                data_groq = json.loads(_clean_json_text(raw_groq))
+                concepts = _validate_concepts_data(data_groq)
+                save_cached_concepts(topic_clean, level, goal, concepts)
+                return concepts
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError) as groq_val_err:
+                sanitized_groq_val = sanitize_error(f"{type(groq_val_err).__name__}: {str(groq_val_err)}")
+                print(f"[LearnMate LOG] Groq generate_concepts validation failed: {sanitized_groq_val}. Retrying Groq...", flush=True)
+                try:
+                    retry_prompt = (
+                        f"{prompt}\n\n"
+                        f"Your previous response failed validation: {sanitized_groq_val}.\n"
+                        "Regenerate strictly valid JSON with exactly 3 objects: concept_id (snake_case), name, common_mistake."
+                    )
+                    raw_groq_retry = self._call_groq_raw(retry_prompt)
+                    data_groq_retry = json.loads(_clean_json_text(raw_groq_retry))
+                    concepts = _validate_concepts_data(data_groq_retry)
+                    save_cached_concepts(topic_clean, level, goal, concepts)
+                    return concepts
+                except Exception as groq_second_err:
+                    sanitized_groq_2 = sanitize_error(f"{type(groq_second_err).__name__}: {str(groq_second_err)}")
+                    print(f"[LearnMate LOG] Groq generate_concepts retry failed: {sanitized_groq_2}", flush=True)
+            except Exception as groq_api_err:
+                sanitized_groq_api = sanitize_error(f"{type(groq_api_err).__name__}: {str(groq_api_err)}")
+                print(f"[LearnMate LOG] Groq generate_concepts API call failed: {sanitized_groq_api}", flush=True)
+
+        # 3. Both failed
+        if is_python_loops_topic(topic_clean):
+            save_cached_concepts(topic_clean, level, goal, PYTHON_LOOPS_CONCEPTS)
+            return PYTHON_LOOPS_CONCEPTS
+        raise LiveAINeededError(
+            "Live AI is needed for this topic. Try Python loops.",
+            debug_details=f"Gemini: {gemini_err_msg}",
+        )
 
     def generate_lesson_llm(self, profile: Profile, weak_concept: Optional[str] = None, topic: Optional[str] = None) -> Lesson:
         """
-        Calls Gemini to generate a 6-section Lesson for any topic.
+        Generates a 6-section Lesson for any topic.
+        Gemini is primary. Automatically falls back to Groq if Gemini returns an API/rate-limit error.
         Prompt requirements:
         - "Explain in {language}. Keep code and technical terms in English."
         - If weak_concept is set:
@@ -752,7 +1096,6 @@ Rules:
             for c in concepts
         )
 
-        is_py = is_python_loops_topic(active_topic)
         if is_py:
             prompt_parts = [
                 f"You are an expert Python programming instructor creating a structured lesson for learner '{profile.name}'.",
@@ -847,43 +1190,92 @@ Exactly 6 sections (types: intro, explain, example, practice, quiz, recap).
 
         initial_prompt = "\n".join(prompt_parts)
 
-        # First attempt
+        # 1. PRIMARY: Try Gemini
+        gemini_failed = False
+        gemini_err_msg = ""
         try:
             raw_text = self._call_gemini_raw(initial_prompt)
-            data = json.loads(raw_text)
+            data = json.loads(_clean_json_text(raw_text))
             lesson = Lesson.model_validate(data)
             normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
             normalized.source = "Live AI"
             save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
             return normalized
-        except Exception as first_error:
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError, Exception) as first_error:
             sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
-            print(f"[LearnMate LOG] generate_lesson_llm initial attempt failed: {sanitized_first}", flush=True)
-            # Retry once with error message
+            is_val_err = isinstance(first_error, (json.JSONDecodeError, ValueError, KeyError, TypeError)) or (
+                hasattr(first_error, "__module__") and "pydantic" in str(first_error.__module__)
+            )
+            if is_val_err:
+                print(f"[LearnMate LOG] generate_lesson_llm Gemini validation failed: {sanitized_first}. Retrying Gemini...", flush=True)
+                try:
+                    retry_prompt = (
+                        f"{initial_prompt}\n\n"
+                        f"Your previous output failed validation with error: {sanitized_first}.\n"
+                        "Please regenerate and ensure the output is strictly valid JSON conforming to the schema."
+                    )
+                    raw_text_retry = self._call_gemini_raw(retry_prompt)
+                    data_retry = json.loads(_clean_json_text(raw_text_retry))
+                    lesson = Lesson.model_validate(data_retry)
+                    normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
+                    normalized.source = "Live AI"
+                    save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
+                    return normalized
+                except Exception as second_error:
+                    gemini_err_msg = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                    print(f"[LearnMate LOG] generate_lesson_llm Gemini retry failed: {gemini_err_msg}", flush=True)
+                    gemini_failed = True
+            else:
+                gemini_err_msg = sanitized_first
+                print(f"[LearnMate LOG] generate_lesson_llm Gemini API error: {gemini_err_msg}. Triggering Groq fallback...", flush=True)
+                gemini_failed = True
+
+        # 2. FALLBACK: Try Groq if Gemini failed
+        if gemini_failed:
+            print(f"[LearnMate LOG] Calling Groq fallback for generate_lesson_llm ({active_topic})...", flush=True)
             try:
-                retry_prompt = (
-                    f"{initial_prompt}\n\n"
-                    f"Your previous output failed validation with error: {sanitized_first}.\n"
-                    "Please regenerate and ensure the output is strictly valid JSON conforming to the schema."
-                )
-                raw_text_retry = self._call_gemini_raw(retry_prompt)
-                data_retry = json.loads(raw_text_retry)
-                lesson = Lesson.model_validate(data_retry)
+                raw_groq = self._call_groq_raw(initial_prompt)
+                data_groq = json.loads(_clean_json_text(raw_groq))
+                lesson = Lesson.model_validate(data_groq)
                 normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
                 normalized.source = "Live AI"
                 save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
                 return normalized
-            except Exception as second_error:
-                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
-                print(f"[LearnMate LOG] generate_lesson_llm retry failed: {sanitized_second}", flush=True)
-                if is_py:
-                    lesson = get_fallback_lesson(profile, weak_concept)
-                    lesson.source = "Fallback"
-                    return lesson
-                raise LiveAINeededError(
-                    "Live AI is needed for this topic. Try Python loops.",
-                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError, Exception) as groq_first_err:
+                sanitized_groq_1 = sanitize_error(f"{type(groq_first_err).__name__}: {str(groq_first_err)}")
+                is_groq_val_err = isinstance(groq_first_err, (json.JSONDecodeError, ValueError, KeyError, TypeError)) or (
+                    hasattr(groq_first_err, "__module__") and "pydantic" in str(groq_first_err.__module__)
                 )
+                if is_groq_val_err:
+                    print(f"[LearnMate LOG] Groq generate_lesson_llm validation failed: {sanitized_groq_1}. Retrying Groq...", flush=True)
+                    try:
+                        retry_prompt = (
+                            f"{initial_prompt}\n\n"
+                            f"Your previous output failed validation with error: {sanitized_groq_1}.\n"
+                            "Please regenerate and ensure the output is strictly valid JSON conforming to the schema."
+                        )
+                        raw_groq_retry = self._call_groq_raw(retry_prompt)
+                        data_groq_retry = json.loads(_clean_json_text(raw_groq_retry))
+                        lesson = Lesson.model_validate(data_groq_retry)
+                        normalized = self._normalize_lesson(lesson, profile, weak_concept, topic=active_topic)
+                        normalized.source = "Live AI"
+                        save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
+                        return normalized
+                    except Exception as groq_second_err:
+                        sanitized_groq_2 = sanitize_error(f"{type(groq_second_err).__name__}: {str(groq_second_err)}")
+                        print(f"[LearnMate LOG] Groq generate_lesson_llm retry failed: {sanitized_groq_2}", flush=True)
+                else:
+                    print(f"[LearnMate LOG] Groq generate_lesson_llm API call failed: {sanitized_groq_1}", flush=True)
+
+        # 3. Both failed
+        if is_py:
+            lesson = get_fallback_lesson(profile, weak_concept)
+            lesson.source = "Fallback"
+            return lesson
+        raise LiveAINeededError(
+            "Live AI is needed for this topic. Try Python loops.",
+            debug_details=f"Gemini: {gemini_err_msg}",
+        )
 
     def _normalize_lesson(self, lesson: Lesson, profile: Profile, weak_concept: Optional[str], topic: str = "Python loops") -> Lesson:
         """Ensures minute invariants and required animation component on parsed lessons."""
@@ -925,7 +1317,8 @@ Exactly 6 sections (types: intro, explain, example, practice, quiz, recap).
         concepts: Optional[list[dict[str, str]]] = None,
     ) -> Quiz:
         """
-        Calls Gemini to generate a 5-question Quiz for topic.
+        Generates a 5-question Quiz for topic.
+        Gemini is primary. Automatically falls back to Groq if Gemini returns an API/rate-limit error.
         Questions must use only the allowed concept_ids.
         Each question: 1 correct answer, 4 options, concept_id from list,
         wrong options based on the concept's common_mistake.
@@ -974,43 +1367,94 @@ Return a valid JSON object matching this schema:
 Ensure exactly 5 questions are provided.
 """
 
-        # First attempt
+        # 1. PRIMARY: Try Gemini
+        gemini_failed = False
+        gemini_err_msg = ""
         try:
             raw_text = self._call_gemini_raw(initial_prompt)
-            data = json.loads(raw_text)
+            data = json.loads(_clean_json_text(raw_text))
             quiz = Quiz.model_validate(data)
             is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
             if not is_valid:
                 raise ValueError(reason)
             quiz.source = "Live AI"
             return quiz
-        except Exception as first_error:
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError, Exception) as first_error:
             sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
-            print(f"[LearnMate LOG] generate_quiz_llm initial attempt failed: {sanitized_first}", flush=True)
-            # Reject and retry once if any rule is broken
+            is_val_err = isinstance(first_error, (json.JSONDecodeError, ValueError, KeyError, TypeError)) or (
+                hasattr(first_error, "__module__") and "pydantic" in str(first_error.__module__)
+            )
+            if is_val_err:
+                print(f"[LearnMate LOG] generate_quiz_llm Gemini validation failed: {sanitized_first}. Retrying Gemini...", flush=True)
+                try:
+                    retry_prompt = (
+                        f"{initial_prompt}\n\n"
+                        f"Your previous response was rejected due to rule violation: {sanitized_first}.\n"
+                        f"You must strictly fix this: exactly 5 questions, 4 options each, correct_index 0-3, and concept_id strictly from [{allowed_list_str}]."
+                    )
+                    raw_text_retry = self._call_gemini_raw(retry_prompt)
+                    data_retry = json.loads(_clean_json_text(raw_text_retry))
+                    quiz = Quiz.model_validate(data_retry)
+                    is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
+                    if not is_valid:
+                        raise ValueError(reason)
+                    quiz.source = "Live AI"
+                    return quiz
+                except Exception as second_error:
+                    gemini_err_msg = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                    print(f"[LearnMate LOG] generate_quiz_llm Gemini retry failed: {gemini_err_msg}", flush=True)
+                    gemini_failed = True
+            else:
+                gemini_err_msg = sanitized_first
+                print(f"[LearnMate LOG] generate_quiz_llm Gemini API error: {gemini_err_msg}. Triggering Groq fallback...", flush=True)
+                gemini_failed = True
+
+        # 2. FALLBACK: Try Groq if Gemini failed
+        if gemini_failed:
+            print(f"[LearnMate LOG] Calling Groq fallback for generate_quiz_llm ({topic})...", flush=True)
             try:
-                retry_prompt = (
-                    f"{initial_prompt}\n\n"
-                    f"Your previous response was rejected due to rule violation: {sanitized_first}.\n"
-                    f"You must strictly fix this: exactly 5 questions, 4 options each, correct_index 0-3, and concept_id strictly from [{allowed_list_str}]."
-                )
-                raw_text_retry = self._call_gemini_raw(retry_prompt)
-                data_retry = json.loads(raw_text_retry)
-                quiz = Quiz.model_validate(data_retry)
+                raw_groq = self._call_groq_raw(initial_prompt)
+                data_groq = json.loads(_clean_json_text(raw_groq))
+                quiz = Quiz.model_validate(data_groq)
                 is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
                 if not is_valid:
                     raise ValueError(reason)
                 quiz.source = "Live AI"
                 return quiz
-            except Exception as second_error:
-                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
-                print(f"[LearnMate LOG] generate_quiz_llm retry failed: {sanitized_second}", flush=True)
-                if is_py:
-                    return get_fallback_quiz(allowed_concept_ids)
-                raise LiveAINeededError(
-                    "Live AI is needed for this topic. Try Python loops.",
-                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
+            except (json.JSONDecodeError, ValueError, KeyError, TypeError, Exception) as groq_first_err:
+                sanitized_groq_1 = sanitize_error(f"{type(groq_first_err).__name__}: {str(groq_first_err)}")
+                is_groq_val_err = isinstance(groq_first_err, (json.JSONDecodeError, ValueError, KeyError, TypeError)) or (
+                    hasattr(groq_first_err, "__module__") and "pydantic" in str(groq_first_err.__module__)
                 )
+                if is_groq_val_err:
+                    print(f"[LearnMate LOG] Groq generate_quiz_llm validation failed: {sanitized_groq_1}. Retrying Groq...", flush=True)
+                    try:
+                        retry_prompt = (
+                            f"{initial_prompt}\n\n"
+                            f"Your previous response was rejected due to rule violation: {sanitized_groq_1}.\n"
+                            f"You must strictly fix this: exactly 5 questions, 4 options each, correct_index 0-3, and concept_id strictly from [{allowed_list_str}]."
+                        )
+                        raw_groq_retry = self._call_groq_raw(retry_prompt)
+                        data_groq_retry = json.loads(_clean_json_text(raw_groq_retry))
+                        quiz = Quiz.model_validate(data_groq_retry)
+                        is_valid, reason = _validate_quiz_rules(quiz, allowed_concept_ids)
+                        if not is_valid:
+                            raise ValueError(reason)
+                        quiz.source = "Live AI"
+                        return quiz
+                    except Exception as groq_second_err:
+                        sanitized_groq_2 = sanitize_error(f"{type(groq_second_err).__name__}: {str(groq_second_err)}")
+                        print(f"[LearnMate LOG] Groq generate_quiz_llm retry failed: {sanitized_groq_2}", flush=True)
+                else:
+                    print(f"[LearnMate LOG] Groq generate_quiz_llm API call failed: {sanitized_groq_1}", flush=True)
+
+        # 3. Both failed
+        if is_py:
+            return get_fallback_quiz(allowed_concept_ids)
+        raise LiveAINeededError(
+            "Live AI is needed for this topic. Try Python loops.",
+            debug_details=f"Gemini: {gemini_err_msg}",
+        )
 
 
 llm_service = LLMService()
