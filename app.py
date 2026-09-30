@@ -14,11 +14,55 @@ st.set_page_config(
     page_title="LearnMate AI | Adaptive Loops Mentor",
     page_icon="✦",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # Apply Teammates' SaaS Styling (flush-left)
 st.markdown(textwrap.dedent(styles.CUSTOM_CSS), unsafe_allow_html=True)
+
+
+# ----------------------------------------------------
+# Sidebar Diagnostics & Startup Check
+# ----------------------------------------------------
+def render_sidebar():
+    """Renders system diagnostics, API key status, and Gemini connectivity check."""
+    with st.sidebar:
+        st.markdown("<h3 style='margin-top: 0; color: #a5b4fc;'>⚙️ System Diagnostics</h3>", unsafe_allow_html=True)
+        from llm import get_gemini_api_key, llm_service
+        has_key = bool(get_gemini_api_key())
+
+        if has_key:
+            st.markdown("🟢 **API key loaded:** `yes`")
+        else:
+            st.markdown("🔴 **API key loaded:** `no`")
+            st.caption("Set `GEMINI_API_KEY` in Streamlit Cloud Secrets or local `.env`.")
+
+        # Startup check: test call to Gemini
+        if "gemini_test_result" not in st.session_state:
+            if not has_key:
+                st.session_state["gemini_test_result"] = (False, "API key not loaded (missing or placeholder in st.secrets / os.environ)")
+            else:
+                with st.spinner("Testing Gemini connection..."):
+                    st.session_state["gemini_test_result"] = llm_service.test_connection()
+
+        test_success, test_msg = st.session_state.get("gemini_test_result", (False, "Not checked"))
+        if test_success:
+            st.success("Gemini test call: Success ✅")
+        else:
+            if has_key:
+                st.error("Gemini test call failed ❌")
+                with st.expander("Test error details", expanded=False):
+                    st.code(test_msg, language="text")
+            else:
+                st.caption(f"Test call skipped: {test_msg}")
+
+        if st.button("🔄 Re-test Gemini Connection", key="btn_retest_gemini", use_container_width=True):
+            with st.spinner("Testing Gemini connection..."):
+                st.session_state["gemini_test_result"] = llm_service.test_connection()
+            st.rerun()
+
+        st.markdown("---")
+        st.caption("LearnMate AI • Adaptive Pedagogical Engine")
 
 
 # ----------------------------------------------------
@@ -275,14 +319,22 @@ def render_form_screen():
                         st.session_state["is_adaptive"] = False
                         st.session_state["quiz_attempt"] = 1
                     set_step("lesson")
-                except LiveAINeededError:
+                except LiveAINeededError as e:
+                    debug_details = getattr(e, "debug_details", f"{type(e).__name__}: {str(e)}")
+                    print(f"[LearnMate UI LOG] LiveAINeededError: {e}\n[Details]: {debug_details}", flush=True)
                     st.error("Live AI is needed for this topic. Try Python loops.")
+                    with st.expander("Debug details", expanded=False):
+                        st.code(debug_details, language="text")
                 except Exception as e:
+                    debug_details = f"{type(e).__name__}: {str(e)}"
+                    print(f"[LearnMate UI LOG] Exception during lesson generation: {debug_details}", flush=True)
                     from llm import is_python_loops_topic
                     if not is_python_loops_topic(selected_topic):
                         st.error("Live AI is needed for this topic. Try Python loops.")
                     else:
                         st.error(f"Error generating lesson: {e}")
+                    with st.expander("Debug details", expanded=False):
+                        st.code(debug_details, language="text")
 
     with col_right:
         st.markdown(
@@ -720,15 +772,28 @@ def render_feedback_screen():
     with col_adapt_btn:
         if st.button("🚀 Start Adaptive Lesson", key="btn_start_adaptive_lesson", type="primary"):
             active_topic = profile.topic or (st.session_state.get("lesson").topic if st.session_state.get("lesson") else "Python loops")
-            with st.spinner("Generating adaptive remedial lesson tailored to diagnosed weak concept..."):
-                adaptive_lesson = generate_lesson(profile, weak_concept=result.weak_concept)
-                quiz_concepts = [result.weak_concept] if result.weak_concept else (st.session_state.get("quiz").concept_ids if st.session_state.get("quiz") else ["range_bounds", "loop_body"])
-                adaptive_quiz = generate_quiz(concept_ids=quiz_concepts, topic=active_topic)
-                st.session_state["lesson"] = adaptive_lesson
-                st.session_state["quiz"] = adaptive_quiz
-                st.session_state["is_adaptive"] = True
-                st.session_state["quiz_attempt"] = st.session_state.get("quiz_attempt", 1) + 1
-            set_step("adaptive_lesson")
+            try:
+                with st.spinner("Generating adaptive remedial lesson tailored to diagnosed weak concept..."):
+                    adaptive_lesson = generate_lesson(profile, weak_concept=result.weak_concept)
+                    quiz_concepts = [result.weak_concept] if result.weak_concept else (st.session_state.get("quiz").concept_ids if st.session_state.get("quiz") else ["range_bounds", "loop_body"])
+                    adaptive_quiz = generate_quiz(concept_ids=quiz_concepts, topic=active_topic)
+                    st.session_state["lesson"] = adaptive_lesson
+                    st.session_state["quiz"] = adaptive_quiz
+                    st.session_state["is_adaptive"] = True
+                    st.session_state["quiz_attempt"] = st.session_state.get("quiz_attempt", 1) + 1
+                set_step("adaptive_lesson")
+            except LiveAINeededError as e:
+                debug_details = getattr(e, "debug_details", f"{type(e).__name__}: {str(e)}")
+                print(f"[LearnMate UI LOG] Adaptive LiveAINeededError: {e}\n[Details]: {debug_details}", flush=True)
+                st.error("Live AI is needed for this topic. Try Python loops.")
+                with st.expander("Debug details", expanded=False):
+                    st.code(debug_details, language="text")
+            except Exception as e:
+                debug_details = f"{type(e).__name__}: {str(e)}"
+                print(f"[LearnMate UI LOG] Adaptive Exception: {debug_details}", flush=True)
+                st.error("Live AI is needed for this topic. Try Python loops.")
+                with st.expander("Debug details", expanded=False):
+                    st.code(debug_details, language="text")
 
     with col_reset_btn:
         if st.button("🔄 Start New Topic / Reset Form", key="btn_feedback_reset"):
@@ -770,6 +835,9 @@ def render_feedback_screen():
 # ====================================================
 # MAIN DISPATCHER
 # ====================================================
+# Always render the sidebar diagnostics and startup checks
+render_sidebar()
+
 current_step = st.session_state.get("step", "landing")
 
 if current_step == "landing":

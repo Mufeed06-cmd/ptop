@@ -341,6 +341,61 @@ class TestLearnMateRealLogic(unittest.TestCase):
         except Exception as e:
             self.fail(f"render_animation crashed on invalid input: {e}")
 
+    def test_get_gemini_api_key_stripping_and_secrets(self):
+        """Step 3: Test that API key strips quotes, whitespace, and works with env and secrets."""
+        from llm import get_gemini_api_key
+        import os
+
+        # Test placeholder ignored
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "paste_your_key_here"}):
+            self.assertIsNone(get_gemini_api_key())
+
+        # Test whitespace and double quotes stripped
+        with patch.dict(os.environ, {"GEMINI_API_KEY": '  "AIzaSyFakeKeyWithQuotes"  '}):
+            key = get_gemini_api_key()
+            self.assertEqual(key, "AIzaSyFakeKeyWithQuotes")
+
+        # Test single quotes stripped
+        with patch.dict(os.environ, {"GEMINI_API_KEY": " 'AIzaSySingleQuotesKey' "}):
+            key = get_gemini_api_key()
+            self.assertEqual(key, "AIzaSySingleQuotesKey")
+
+    def test_sanitize_error_redacts_keys(self):
+        """Never print or expose the API key in logs or debug expander."""
+        from llm import sanitize_error
+        import os
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyFakeSecretKey1234567890123456"}):
+            raw_msg = "Error 403 on https://generativelanguage.googleapis.com/v1beta/models?key=AIzaSyFakeSecretKey1234567890123456"
+            sanitized = sanitize_error(raw_msg)
+            self.assertNotIn("AIzaSyFakeSecretKey1234567890123456", sanitized)
+            self.assertIn("[REDACTED_API_KEY]", sanitized)
+
+    def test_live_ai_needed_error_details(self):
+        """Step 2: LiveAINeededError holds debug details while str() returns the standard prompt."""
+        from llm import LiveAINeededError
+        err = LiveAINeededError("Live AI is needed for this topic. Try Python loops.", debug_details="RuntimeError: 403 Forbidden")
+        self.assertEqual(str(err), "Live AI is needed for this topic. Try Python loops.")
+        self.assertEqual(err.debug_details, "RuntimeError: 403 Forbidden")
+
+    def test_gemini_test_connection_and_model_config(self):
+        """Step 4 & 5: Test connection helper and generation config."""
+        from llm import llm_service
+        import os
+
+        # When key is missing or placeholder
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "paste_your_key_here"}):
+            success, msg = llm_service.test_connection()
+            self.assertFalse(success)
+            self.assertIn("not configured", msg)
+
+        # When mock call succeeds
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaFakeValidKeyForTesting1234567"}):
+            with patch.object(llm_service, "_call_gemini_raw", return_value='{"status": "ok"}'):
+                success, msg = llm_service.test_connection()
+                self.assertTrue(success)
+                self.assertEqual(msg, "Success")
+
 
 if __name__ == "__main__":
     unittest.main()

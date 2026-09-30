@@ -6,3 +6,4 @@ learnmate_incoming/
 venv/
 .venv/
 *.pyc
+cache/

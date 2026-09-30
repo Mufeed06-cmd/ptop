@@ -348,9 +348,79 @@ def is_python_loops_topic(topic: Optional[str]) -> bool:
     return ("python" in t and "loop" in t) or t in ["python loops", "python - loops", "loops"]
 
 
+def get_gemini_api_key() -> Optional[str]:
+    """
+    Retrieves the Gemini API key from:
+    1. st.secrets["GEMINI_API_KEY"] (if running in Streamlit with secrets configured)
+    2. os.getenv("GEMINI_API_KEY") (or os.environ.get("GEMINI_API_KEY"))
+    Strips any whitespace or surrounding quotes (' or ").
+    Returns None if missing or placeholder. Never prints the key.
+    """
+    raw_key: Optional[str] = None
+
+    # Check Streamlit secrets first
+    try:
+        import streamlit as st
+        try:
+            if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+                raw_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            pass
+        if not raw_key:
+            try:
+                if hasattr(st, "secrets") and hasattr(st.secrets, "get"):
+                    raw_key = st.secrets.get("GEMINI_API_KEY")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Fall back to environment variable
+    if not raw_key:
+        raw_key = os.getenv("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+
+    if not raw_key:
+        return None
+
+    # Strip whitespace
+    key = str(raw_key).strip()
+
+    # Strip single or double quotes at the ends
+    if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
+        key = key[1:-1].strip()
+    key = key.strip("\"' \t\r\n")
+
+    if not key or key == "paste_your_key_here":
+        return None
+
+    # Also synchronize to os.environ so any underlying SDK/subprocesses have it
+    os.environ["GEMINI_API_KEY"] = key
+    return key
+
+
+def sanitize_error(err: Any) -> str:
+    """Removes any API keys from error messages before logging or rendering."""
+    msg = str(err)
+    key = get_gemini_api_key()
+    if key and key in msg:
+        msg = msg.replace(key, "[REDACTED_API_KEY]")
+    msg = re.sub(r'AIza[0-9A-Za-z-_]{35}', '[REDACTED_API_KEY]', msg)
+    return msg
+
+
 class LiveAINeededError(Exception):
     """Raised when live AI is needed for a topic but Gemini is unavailable or failed."""
-    pass
+    def __init__(
+        self,
+        message: str = "Live AI is needed for this topic. Try Python loops.",
+        debug_details: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.debug_details = debug_details or message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 PYTHON_LOOPS_CONCEPTS = [
@@ -490,51 +560,106 @@ class LLMService:
     """
     Interacts with Google Gemini with:
     - Temperature 0.3
-    - JSON response mode
+    - JSON response mode (response_mime_type="application/json")
     - Pydantic validation
     - Single retry on validation error
     - Hardcoded fallback on persistent error
-    - API key read strictly from GEMINI_API_KEY environment variable
+    - API key read safely from st.secrets and os.getenv with whitespace and quote stripping
     """
 
     def __init__(self):
         self._genai = None
         self._model = None
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self._setup_error: Optional[str] = None
         self._setup_client()
 
     def _setup_client(self) -> None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key or api_key.strip() == "paste_your_key_here":
+        api_key = get_gemini_api_key()
+        if not api_key:
+            self._model = None
+            self._setup_error = "GEMINI_API_KEY is not configured or is a placeholder in st.secrets / os.environ."
             return
 
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
             self._genai = genai
-            self._model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "temperature": 0.3,
-                },
+            self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+            generation_config = genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
             )
-        except Exception:
+            self._model = genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=generation_config,
+            )
+            self._setup_error = None
+        except Exception as e:
             self._model = None
+            self._setup_error = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Failed to setup Gemini client: {self._setup_error}", flush=True)
 
     @property
     def is_configured(self) -> bool:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        return bool(api_key and api_key.strip() != "paste_your_key_here") and self._model is not None
+        api_key = get_gemini_api_key()
+        return bool(api_key) and self._model is not None
+
+    def test_connection(self) -> tuple[bool, str]:
+        """Performs a small test call to Gemini, returning (success, message). Never leaks keys."""
+        api_key = get_gemini_api_key()
+        if not api_key:
+            return False, "GEMINI_API_KEY is not configured or is a placeholder."
+
+        if not self._model:
+            self._setup_client()
+
+        if not self._model:
+            return False, self._setup_error or "Gemini client could not be initialized."
+
+        try:
+            # Send a tiny prompt to verify connectivity & JSON mode
+            raw = self._call_gemini_raw('Respond with JSON: {"status": "ok"}')
+            json.loads(raw.strip())
+            return True, "Success"
+        except Exception as e:
+            sanitized = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Gemini test connection failed: {sanitized}", flush=True)
+            return False, sanitized
 
     def _call_gemini_raw(self, prompt: str) -> str:
         """Invokes Gemini with configured temperature 0.3 and JSON response mode."""
         if not self._model:
             self._setup_client()
         if not self._model:
-            raise RuntimeError("Gemini client is not configured (missing or invalid GEMINI_API_KEY).")
+            raise RuntimeError(f"Gemini client is not configured: {self._setup_error or 'missing or invalid GEMINI_API_KEY'}")
 
-        response = self._model.generate_content(prompt)
-        return response.text
+        try:
+            response = self._model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            err_msg = str(e)
+            if ("not found" in err_msg.lower() or "404" in err_msg) and self.model_name != "gemini-2.0-flash":
+                print(f"[LearnMate LOG] Model {self.model_name} not found. Attempting fallback to gemini-2.0-flash...", flush=True)
+                try:
+                    self.model_name = "gemini-2.0-flash"
+                    generation_config = self._genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        temperature=0.3,
+                    )
+                    self._model = self._genai.GenerativeModel(
+                        model_name="gemini-2.0-flash",
+                        generation_config=generation_config,
+                    )
+                    response = self._model.generate_content(prompt)
+                    return response.text
+                except Exception as e2:
+                    sanitized2 = sanitize_error(f"{type(e2).__name__}: {str(e2)}")
+                    print(f"[LearnMate LOG] Gemini fallback call failed: {sanitized2}", flush=True)
+                    raise
+            sanitized = sanitize_error(f"{type(e).__name__}: {str(e)}")
+            print(f"[LearnMate LOG] Gemini call failed: {sanitized}", flush=True)
+            raise
 
     def generate_concepts(self, topic: str, level: str = "beginner", goal: Optional[str] = None) -> list[dict[str, str]]:
         """
@@ -572,10 +697,12 @@ Rules:
             save_cached_concepts(topic_clean, level, goal, concepts)
             return concepts
         except Exception as first_error:
+            sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
+            print(f"[LearnMate LOG] generate_concepts initial attempt failed: {sanitized_first}", flush=True)
             try:
                 retry_prompt = (
                     f"{prompt}\n\n"
-                    f"Your previous response failed validation: {str(first_error)}.\n"
+                    f"Your previous response failed validation: {sanitized_first}.\n"
                     "Regenerate strictly valid JSON with exactly 3 objects: concept_id (snake_case), name, common_mistake."
                 )
                 raw_retry = self._call_gemini_raw(retry_prompt)
@@ -583,11 +710,16 @@ Rules:
                 concepts = _validate_concepts_data(data_retry)
                 save_cached_concepts(topic_clean, level, goal, concepts)
                 return concepts
-            except Exception:
+            except Exception as second_error:
+                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                print(f"[LearnMate LOG] generate_concepts retry failed: {sanitized_second}", flush=True)
                 if is_python_loops_topic(topic_clean):
                     save_cached_concepts(topic_clean, level, goal, PYTHON_LOOPS_CONCEPTS)
                     return PYTHON_LOOPS_CONCEPTS
-                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
+                raise LiveAINeededError(
+                    "Live AI is needed for this topic. Try Python loops.",
+                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
+                )
 
     def generate_lesson_llm(self, profile: Profile, weak_concept: Optional[str] = None, topic: Optional[str] = None) -> Lesson:
         """
@@ -725,11 +857,13 @@ Exactly 6 sections (types: intro, explain, example, practice, quiz, recap).
             save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
             return normalized
         except Exception as first_error:
+            sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
+            print(f"[LearnMate LOG] generate_lesson_llm initial attempt failed: {sanitized_first}", flush=True)
             # Retry once with error message
             try:
                 retry_prompt = (
                     f"{initial_prompt}\n\n"
-                    f"Your previous output failed validation with error: {str(first_error)}.\n"
+                    f"Your previous output failed validation with error: {sanitized_first}.\n"
                     "Please regenerate and ensure the output is strictly valid JSON conforming to the schema."
                 )
                 raw_text_retry = self._call_gemini_raw(retry_prompt)
@@ -739,12 +873,17 @@ Exactly 6 sections (types: intro, explain, example, practice, quiz, recap).
                 normalized.source = "Live AI"
                 save_cached_lesson(active_topic, profile.skill_level, language, profile.minutes, weak_concept, normalized)
                 return normalized
-            except Exception:
+            except Exception as second_error:
+                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                print(f"[LearnMate LOG] generate_lesson_llm retry failed: {sanitized_second}", flush=True)
                 if is_py:
                     lesson = get_fallback_lesson(profile, weak_concept)
                     lesson.source = "Fallback"
                     return lesson
-                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
+                raise LiveAINeededError(
+                    "Live AI is needed for this topic. Try Python loops.",
+                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
+                )
 
     def _normalize_lesson(self, lesson: Lesson, profile: Profile, weak_concept: Optional[str], topic: str = "Python loops") -> Lesson:
         """Ensures minute invariants and required animation component on parsed lessons."""
@@ -846,11 +985,13 @@ Ensure exactly 5 questions are provided.
             quiz.source = "Live AI"
             return quiz
         except Exception as first_error:
+            sanitized_first = sanitize_error(f"{type(first_error).__name__}: {str(first_error)}")
+            print(f"[LearnMate LOG] generate_quiz_llm initial attempt failed: {sanitized_first}", flush=True)
             # Reject and retry once if any rule is broken
             try:
                 retry_prompt = (
                     f"{initial_prompt}\n\n"
-                    f"Your previous response was rejected due to rule violation: {str(first_error)}.\n"
+                    f"Your previous response was rejected due to rule violation: {sanitized_first}.\n"
                     f"You must strictly fix this: exactly 5 questions, 4 options each, correct_index 0-3, and concept_id strictly from [{allowed_list_str}]."
                 )
                 raw_text_retry = self._call_gemini_raw(retry_prompt)
@@ -861,10 +1002,15 @@ Ensure exactly 5 questions are provided.
                     raise ValueError(reason)
                 quiz.source = "Live AI"
                 return quiz
-            except Exception:
+            except Exception as second_error:
+                sanitized_second = sanitize_error(f"{type(second_error).__name__}: {str(second_error)}")
+                print(f"[LearnMate LOG] generate_quiz_llm retry failed: {sanitized_second}", flush=True)
                 if is_py:
                     return get_fallback_quiz(allowed_concept_ids)
-                raise LiveAINeededError("Live AI is needed for this topic. Try Python loops.")
+                raise LiveAINeededError(
+                    "Live AI is needed for this topic. Try Python loops.",
+                    debug_details=f"{sanitized_second}\n(Initial attempt failed: {sanitized_first})",
+                )
 
 
 llm_service = LLMService()
